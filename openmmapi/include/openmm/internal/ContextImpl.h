@@ -215,15 +215,6 @@ public:
      */
     int& getLastForceGroups();
     /**
-     * Calculate the potential energy of the system (in kJ/mol).  This gives the same result as asking
-     * Context::getState() for State::Energy, including computing forces if the integrator needs them
-     * to compute the kinetic energy, but it does not compute the kinetic energy itself.
-     *
-     * @param groups   a set of bit flags for which force groups to include.  Group i will be included
-     *                 if (groups&(1<<i)) != 0.  The default value includes all groups.
-     */
-    double calcPotentialEnergy(int groups=0xFFFFFFFF);
-    /**
      * Calculate the kinetic energy of the system (in kJ/mol).
      */
     double calcKineticEnergy();

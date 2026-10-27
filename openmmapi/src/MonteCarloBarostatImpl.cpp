@@ -66,7 +66,7 @@ void MonteCarloBarostatImpl::updateContextState(ContextImpl& context, bool& forc
     // Compute the current potential energy.
 
     int groups = context.getIntegrator().getIntegrationForceGroups();
-    double initialEnergy = context.calcPotentialEnergy(groups);
+    double initialEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
 
     // Modify the periodic box size.
 
@@ -87,7 +87,7 @@ void MonteCarloBarostatImpl::updateContextState(ContextImpl& context, bool& forc
         numberOfScaledParticles = context.getMolecules().size();
     else
         numberOfScaledParticles = context.getSystem().getNumParticles();
-    double finalEnergy = context.calcPotentialEnergy(groups);
+    double finalEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
     double pressure = context.getParameter(MonteCarloBarostat::Pressure())*(AVOGADRO*1e-25);
     double kT = BOLTZ*context.getParameter(MonteCarloBarostat::Temperature());
     double w = finalEnergy-initialEnergy + pressure*deltaVolume - numberOfScaledParticles*kT*log(newVolume/volume);

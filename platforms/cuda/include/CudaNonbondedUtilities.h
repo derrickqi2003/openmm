@@ -330,7 +330,7 @@ private:
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
     bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams;
-    bool useLazyOverflowCheck, countDownloadPending, useGatedBlockSort;
+    bool useLazyOverflowCheck, lazyCheckActive, countDownloadPending, useGatedBlockSort;
     int startTileIndex, startBlockIndex, numBlocks, maxExclusions, numForceThreadBlocks, forceThreadBlockSize, numAtoms, groupFlags, numBlockSizes, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     long long numTiles;

@@ -59,7 +59,7 @@ public:
 
 CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
         pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0),
-        useLazyOverflowCheck(false), countDownloadPending(false), useGatedBlockSort(false) {
+        useLazyOverflowCheck(false), lazyCheckActive(false), countDownloadPending(false), useGatedBlockSort(false) {
     // Decide how many thread blocks to use.
 
     string errorMessage = "Error initializing nonbonded utilities";
@@ -246,7 +246,10 @@ void CudaNonbondedUtilities::initialize(const System& system) {
     // Create data structures for the neighbor list.
 
     maxCutoff = getMaxCutoffDistance();
-    useLazyOverflowCheck = (useNeighborList && context.getPlatformData().contexts.size() == 1);
+    // Deferring the check for neighbor list overflow relies on a fallback kernel that enumerates every tile, so only
+    // allow it when that is cheap enough to be an acceptable cost on the rare steps that need it.  The multi-GPU
+    // code checks the counts itself.
+    useLazyOverflowCheck = (useNeighborList && context.getPlatformData().contexts.size() == 1 && numAtomBlocks <= 4096);
     if (useCutoff) {
         // Select a size for the arrays that hold the neighbor list.  We have to make a fairly
         // arbitrary guess, but if this turns out to be too small we'll increase it later.
@@ -425,7 +428,7 @@ void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
     context.executeKernel(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms());
     context.executeKernel(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtoms(), 256);
     forceRebuildNeighborList = false;
-    if (!useLazyOverflowCheck || !countDownloadPending) {
+    if (!lazyCheckActive || !countDownloadPending) {
         interactionCount.download(pinnedCountBuffer, false);
         cuEventRecord(downloadCountEvent, context.getCurrentStream());
         countDownloadPending = true;
@@ -452,7 +455,7 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
         if (!hasInitializedParams)
             initParamArgs();
         context.executeKernel(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
-        if (useLazyOverflowCheck && numTiles > 0) {
+        if (lazyCheckActive && numTiles > 0) {
             // Computes the interactions on the GPU if the neighbor list overflowed, and otherwise returns immediately.
             CUfunction& fallback = (includeForces ? (includeEnergy ? kernels.fallbackForceEnergyKernel : kernels.fallbackForceKernel) : kernels.fallbackEnergyKernel);
             if (fallback == NULL)
@@ -461,7 +464,7 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
         }
     }
     if (useNeighborList && numTiles > 0) {
-        if (useLazyOverflowCheck) {
+        if (lazyCheckActive) {
             // The forces are correct even if the neighbor list overflowed, so there is no need to wait for the GPU.
             // Check the counts whenever a download has completed, and enlarge the arrays if necessary.
             if (countDownloadPending && cuEventQuery(downloadCountEvent) == CUDA_SUCCESS) {
@@ -472,7 +475,8 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
         else {
             cuEventSynchronize(downloadCountEvent);
             countDownloadPending = false;
-            updateNeighborListSize();
+            if (!updateNeighborListSize() && useLazyOverflowCheck)
+                lazyCheckActive = true; // The neighbor list fits, so later checks can be deferred.
         }
     }
 }
@@ -491,7 +495,7 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
     // this from happening in the future.  If we didn't wait for the counts, kernels using the current arrays may
     // still be queued, so let them finish before replacing the arrays.
 
-    if (useLazyOverflowCheck) {
+    if (lazyCheckActive) {
         string errorMessage = "Error synchronizing before resizing the neighbor list";
         CHECK_RESULT(cuCtxSynchronize());
     }
@@ -519,8 +523,13 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
         findInteractingBlocksArgs[8] = &singlePairs.getDevicePointer();
     }
     forceRebuildNeighborList = true;
-    if (!useLazyOverflowCheck)
-        context.setForcesValid(false); // With the lazy check, the fallback kernel already computed correct forces.
+    if (lazyCheckActive) {
+        // The fallback kernel already computed correct forces.  Check synchronously again until the neighbor
+        // list has been built without overflowing.
+        lazyCheckActive = false;
+    }
+    else
+        context.setForcesValid(false);
     return true;
 }
 
