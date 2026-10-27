@@ -330,6 +330,7 @@ void CommonUpdateStateDataKernel::getPeriodicBoxVectors(ContextImpl& context, Ve
 }
 
 void CommonUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, const Vec3& a, const Vec3& b, const Vec3& c) {
+    ContextSelector selector(cc);
     if (!cc.getBoxIsTriclinic() && (b[0] != 0 || c[0] != 0 || c[1] != 0))
         throw OpenMMException("The box shape has changed from rectangular to triclinic.  To do this, you must call setDefaultPeriodicBoxVectors() on the System to specify a triclinic default box, then reinitialize the Context.");
 
@@ -345,7 +346,6 @@ void CommonUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, co
         }
     }
     if (hasOffsets) {
-        ContextSelector selector(cc);
         vector<mm_int4>& offsets = cc.getPosCellOffsets();
         if (!cellOffsetsBuffer.isInitialized()) {
             cellOffsetsBuffer.initialize<mm_int4>(cc, offsets.size(), "cellOffsetsBuffer");

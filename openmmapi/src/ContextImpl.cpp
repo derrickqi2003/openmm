@@ -320,6 +320,10 @@ int& ContextImpl::getLastForceGroups() {
     return lastForceGroups;
 }
 
+double ContextImpl::calcPotentialEnergy(int groups) {
+    return calcForcesAndEnergy(integrator.kineticEnergyRequiresForce(), true, groups);
+}
+
 double ContextImpl::calcKineticEnergy() {
     return integrator.computeKineticEnergy();
 }
