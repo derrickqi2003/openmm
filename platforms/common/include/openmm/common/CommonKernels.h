@@ -156,8 +156,8 @@ public:
 protected:
     ComputeContext& cc;
 private:
-    ComputeArray floatBuffer, doubleBuffer;
-    ComputeKernel copyFloatKernel, copyDoubleKernel;
+    ComputeArray floatBuffer, doubleBuffer, cellOffsetsBuffer;
+    ComputeKernel copyFloatKernel, copyDoubleKernel, removeCellOffsetsKernel;
 };
 
 /**

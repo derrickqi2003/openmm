@@ -72,6 +72,7 @@ void CommonUpdateStateDataKernel::initialize(const System& system) {
         copyDoubleKernel->addArg();
         copyDoubleKernel->addArg(cc.getNumAtoms());
     }
+    removeCellOffsetsKernel = program->createKernel("removeCellOffsets");
 }
 
 double CommonUpdateStateDataKernel::getTime(const ContextImpl& context) const {
@@ -333,22 +334,51 @@ void CommonUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, co
         throw OpenMMException("The box shape has changed from rectangular to triclinic.  To do this, you must call setDefaultPeriodicBoxVectors() on the System to specify a triclinic default box, then reinitialize the Context.");
 
     // If any particles have been wrapped to the first periodic box, we need to unwrap them
-    // to avoid changing their positions.
+    // to avoid changing their positions.  This is done on the device, and is equivalent to
+    // calling getPositions() with the old box vectors followed by setPositions().
 
-    vector<Vec3> positions;
+    bool hasOffsets = false;
     for (auto offset : cc.getPosCellOffsets()) {
         if (offset.x != 0 || offset.y != 0 || offset.z != 0) {
-            getPositions(context, positions);
+            hasOffsets = true;
             break;
         }
+    }
+    if (hasOffsets) {
+        ContextSelector selector(cc);
+        vector<mm_int4>& offsets = cc.getPosCellOffsets();
+        if (!cellOffsetsBuffer.isInitialized()) {
+            cellOffsetsBuffer.initialize<mm_int4>(cc, offsets.size(), "cellOffsetsBuffer");
+            removeCellOffsetsKernel->addArg(cc.getPosq());
+            if (cc.getUseMixedPrecision())
+                removeCellOffsetsKernel->addArg(cc.getPosqCorrection());
+            removeCellOffsetsKernel->addArg(cellOffsetsBuffer);
+            removeCellOffsetsKernel->addArg(cc.getNumAtoms());
+            for (int i = 0; i < 6; i++)
+                removeCellOffsetsKernel->addArg();
+        }
+        cellOffsetsBuffer.upload(offsets);
+        Vec3 oldBox[3];
+        cc.getPeriodicBoxVectors(oldBox[0], oldBox[1], oldBox[2]);
+        double boxValues[] = {oldBox[0][0], oldBox[1][0], oldBox[1][1], oldBox[2][0], oldBox[2][1], oldBox[2][2]};
+        int firstBoxArg = (cc.getUseMixedPrecision() ? 4 : 3);
+        for (int i = 0; i < 6; i++) {
+            if (cc.getSupportsDoublePrecision())
+                removeCellOffsetsKernel->setArg(firstBoxArg+i, boxValues[i]);
+            else
+                removeCellOffsetsKernel->setArg(firstBoxArg+i, (float) boxValues[i]);
+        }
+        removeCellOffsetsKernel->execute(cc.getNumAtoms());
+        for (auto& offset : offsets)
+            offset = mm_int4(0, 0, 0, 0);
     }
 
     // Update the vectors.
 
     for (auto ctx : cc.getAllContexts())
         ctx->setPeriodicBoxVectors(a, b, c);
-    if (positions.size() > 0)
-        setPositions(context, positions);
+    if (hasOffsets)
+        cc.reorderAtoms(); // setPositions() would have done this
 }
 
 void CommonUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream& stream) {
