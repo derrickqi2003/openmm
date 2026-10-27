@@ -280,7 +280,7 @@ public:
      * @param includeForces whether this kernel should compute forces
      * @param includeEnergy whether this kernel should compute potential energy
      */
-    CUfunction createInteractionKernel(const std::string& source, std::vector<ComputeParameterInfo>& params, std::vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy);
+    CUfunction createInteractionKernel(const std::string& source, std::vector<ComputeParameterInfo>& params, std::vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy, bool overflowFallback=false);
     /**
      * Create the set of kernels that will be needed for a particular combination of force groups.
      * 
@@ -310,6 +310,7 @@ private:
     CudaArray blockCenter;
     CudaArray blockBoundingBox;
     CudaArray sortedBlocks;
+    CudaArray blockSortKeys;
     CudaArray sortedBlockCenter;
     CudaArray sortedBlockBoundingBox;
     CudaArray blockSizeRange;
@@ -320,7 +321,7 @@ private:
     ComputeSort blockSorter;
     CUevent downloadCountEvent;
     unsigned int* pinnedCountBuffer;
-    std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs;
+    std::vector<void*> forceArgs, findBlockBoundsArgs, checkRebuildArgs, computeSortKeysArgs, sortBlockKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;
     std::vector<ComputeParameterInfo> arguments;
@@ -329,6 +330,7 @@ private:
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
     bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams;
+    bool useLazyOverflowCheck, countDownloadPending, useGatedBlockSort;
     int startTileIndex, startBlockIndex, numBlocks, maxExclusions, numForceThreadBlocks, forceThreadBlockSize, numAtoms, groupFlags, numBlockSizes, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     long long numTiles;
@@ -344,8 +346,11 @@ public:
     bool hasForces;
     std::string source;
     CUfunction forceKernel, energyKernel, forceEnergyKernel;
+    CUfunction fallbackForceKernel, fallbackEnergyKernel, fallbackForceEnergyKernel;
     CUfunction findBlockBoundsKernel;
     CUfunction computeSortKeysKernel;
+    CUfunction checkRebuildKernel;
+    CUfunction sortBlockKeysKernel;
     CUfunction sortBoxDataKernel;
     CUfunction findInteractingBlocksKernel;
     CUfunction findInteractionsWithinBlocksKernel;

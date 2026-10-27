@@ -117,6 +117,14 @@ extern "C" __global__ void computeNonbonded(
     const unsigned int tbx = threadIdx.x - tgx;           // block warpIndex
     mixed energy = 0;
     INIT_DERIVATIVES
+#ifdef OVERFLOW_FALLBACK
+    // This variant of the kernel is launched after the regular one on every step, but only does anything if the
+    // neighbor list overflowed its buffers.  In that case the regular kernel skips the neighbor list, and this one
+    // computes all tiles without exclusions by enumerating them.  This keeps the forces exact without the host
+    // having to wait for the neighbor list to be built on every step.
+    if (interactionCount[0] <= maxTiles && interactionCount[1] <= maxSinglePairs)
+        return;
+#else
 
     // First loop: process tiles that contain exclusions.
 
@@ -264,13 +272,16 @@ extern "C" __global__ void computeNonbonded(
 #endif
     }
 
+#endif // OVERFLOW_FALLBACK
+
     // Second loop: tiles without exclusions, either from the neighbor list (with cutoff) or just enumerating all
     // of them (no cutoff).
 
 #ifdef USE_NEIGHBOR_LIST
-    const unsigned int numTiles = interactionCount[0];
-    if (numTiles > maxTiles)
-        return; // There wasn't enough memory for the neighbor list.
+    // If there wasn't enough memory for the neighbor list, skip it.  The OVERFLOW_FALLBACK variant of this kernel
+    // computes these interactions instead.
+    const bool neighborListOverflow = (interactionCount[0] > maxTiles || interactionCount[1] > maxSinglePairs);
+    const unsigned int numTiles = (neighborListOverflow ? 0 : interactionCount[0]);
     int pos = (int) (warp*(long long)numTiles/totalWarps);
     int end = (int) ((warp+1)*(long long)numTiles/totalWarps);
 #else
@@ -477,9 +488,7 @@ extern "C" __global__ void computeNonbonded(
     // Third loop: single pairs that aren't part of a tile.
     
 #if USE_NEIGHBOR_LIST
-    const unsigned int numPairs = interactionCount[1];
-    if (numPairs > maxSinglePairs)
-        return; // There wasn't enough memory for the neighbor list.
+    const unsigned int numPairs = (neighborListOverflow ? 0 : interactionCount[1]);
     for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < numPairs; i += blockDim.x*gridDim.x) {
         int2 pair = singlePairs[i];
         int atom1 = pair.x;

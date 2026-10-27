@@ -141,6 +141,7 @@ private:
     ComputeArray energyBuffer, scaleFactorBuffer, kineticEnergyBuffer, chainMasses, chainForces, heatBathEnergy;
     std::map<int, ComputeArray> atomlists, pairlists;
     std::map<int, ComputeKernel> propagateKernels;
+    std::map<int, ComputeKernel> propagateFastKernels;
     bool hasInitializedPropagateKernel;
     bool hasInitializedKineticEnergyKernel;
     bool hasInitializedHeatBathEnergyKernel;

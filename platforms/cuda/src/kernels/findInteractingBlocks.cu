@@ -101,7 +101,30 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
         rebuildNeighborList[0] = 0;
 }
 
-extern "C" __global__ void computeSortKeys(const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks, real2* __restrict__ blockSizeRange, int numSizes) {
+/**
+ * Check whether any atom has moved enough so that we really need to rebuild the neighbor list.  The kernels that
+ * build the neighbor list return immediately if it does not need to be rebuilt.
+ */
+extern "C" __global__ void checkRebuildNeighborList(const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
+        unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild) {
+    bool rebuild = forceRebuild;
+    for (int i = threadIdx.x+blockIdx.x*blockDim.x; i < NUM_ATOMS; i += blockDim.x*gridDim.x) {
+        real4 delta = oldPositions[i]-posq[i];
+        if (delta.x*delta.x + delta.y*delta.y + delta.z*delta.z > 0.25f*PADDING*PADDING)
+            rebuild = true;
+    }
+    if (rebuild) {
+        rebuildNeighborList[0] = 1;
+        interactionCount[0] = 0;
+        interactionCount[1] = 0;
+    }
+}
+
+extern "C" __global__ void computeSortKeys(const real4* __restrict__ blockBoundingBox, unsigned int* __restrict__ sortedBlocks, real2* __restrict__ blockSizeRange, int numSizes,
+        const int* __restrict__ rebuildNeighborList) {
+    if (rebuildNeighborList[0] == 0)
+        return; // The neighbor list doesn't need to be rebuilt.
+
     // Find the total range of sizes recorded by all blocks.
 
     __shared__ real2 sizeRange;
@@ -133,6 +156,31 @@ extern "C" __global__ void computeSortKeys(const real4* __restrict__ blockBoundi
 }
 
 /**
+ * Sort the keys computed by computeSortKeys.  Every key is unique, since its low order bits hold the block index,
+ * so each one goes to the position given by the number of smaller keys.  This must be launched with work groups
+ * of 128 threads and enough threads to cover all NUM_BLOCKS keys.
+ */
+extern "C" __global__ void sortBlockKeys(const unsigned int* __restrict__ keys, unsigned int* __restrict__ sortedKeys, const int* __restrict__ rebuildNeighborList) {
+    if (rebuildNeighborList[0] == 0)
+        return; // The neighbor list doesn't need to be rebuilt.
+    __shared__ unsigned int keyBuffer[128];
+    const int index = blockIdx.x*blockDim.x+threadIdx.x;
+    const unsigned int key = keys[index < NUM_BLOCKS ? index : 0];
+    int count = 0;
+    for (int start = 0; start < NUM_BLOCKS; start += blockDim.x) {
+        int numInBlock = min((int) blockDim.x, NUM_BLOCKS-start);
+        __syncthreads();
+        if (threadIdx.x < numInBlock)
+            keyBuffer[threadIdx.x] = keys[start+threadIdx.x];
+        __syncthreads();
+        for (int i = 0; i < numInBlock; i++)
+            count += (keyBuffer[i] < key ? 1 : 0);
+    }
+    if (index < NUM_BLOCKS)
+        sortedKeys[count] = key;
+}
+
+/**
  * Sort the data about bounding boxes so it can be accessed more efficiently in the next kernel.
  */
 extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBlocks, const real4* __restrict__ blockCenter,
@@ -141,8 +189,9 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         real4* __restrict__ largeBlockCenter, half3* __restrict__ largeBlockBoundingBox, real4 periodicBoxSize,
         real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
 #endif
-        const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
-        unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild) {
+        const int* __restrict__ rebuildNeighborList) {
+    if (rebuildNeighborList[0] == 0)
+        return; // The neighbor list doesn't need to be rebuilt.
     for (int i = threadIdx.x+blockIdx.x*blockDim.x; i < NUM_BLOCKS; i += blockDim.x*gridDim.x) {
         unsigned int index = sortedBlocks[i] & BLOCK_INDEX_MASK;
         sortedBlockCenter[i] = blockCenter[index];
@@ -168,20 +217,6 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         largeBlockCenter[i] = 0.5f*(maxPos+minPos);
         largeBlockBoundingBox[i] = half3(trimTo3(0.5f*(maxPos-minPos)));
 #endif
-    }
-
-    // Also check whether any atom has moved enough so that we really need to rebuild the neighbor list.
-
-    bool rebuild = forceRebuild;
-    for (int i = threadIdx.x+blockIdx.x*blockDim.x; i < NUM_ATOMS; i += blockDim.x*gridDim.x) {
-        real4 delta = oldPositions[i]-posq[i];
-        if (delta.x*delta.x + delta.y*delta.y + delta.z*delta.z > 0.25f*PADDING*PADDING)
-            rebuild = true;
-    }
-    if (rebuild) {
-        rebuildNeighborList[0] = 1;
-        interactionCount[0] = 0;
-        interactionCount[1] = 0;
     }
 }
 

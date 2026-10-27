@@ -58,7 +58,8 @@ public:
 };
 
 CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0) {
+        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0),
+        useLazyOverflowCheck(false), countDownloadPending(false), useGatedBlockSort(false) {
     // Decide how many thread blocks to use.
 
     string errorMessage = "Error initializing nonbonded utilities";
@@ -245,6 +246,7 @@ void CudaNonbondedUtilities::initialize(const System& system) {
     // Create data structures for the neighbor list.
 
     maxCutoff = getMaxCutoffDistance();
+    useLazyOverflowCheck = (useNeighborList && context.getPlatformData().contexts.size() == 1);
     if (useCutoff) {
         // Select a size for the arrays that hold the neighbor list.  We have to make a fairly
         // arbitrary guess, but if this turns out to be too small we'll increase it later.
@@ -263,6 +265,11 @@ void CudaNonbondedUtilities::initialize(const System& system) {
         blockCenter.initialize(context, numAtomBlocks, 4*elementSize, "blockCenter");
         blockBoundingBox.initialize(context, numAtomBlocks, 4*elementSize, "blockBoundingBox");
         sortedBlocks.initialize<unsigned int>(context, numAtomBlocks, "sortedBlocks");
+        // For lists short enough that the generic sort would use a single rank sort kernel anyway, use one that
+        // skips the work when the neighbor list doesn't need to be rebuilt.
+        useGatedBlockSort = (numAtomBlocks <= CudaContext::ThreadBlockSize*context.getNumThreadBlocks());
+        if (useGatedBlockSort)
+            blockSortKeys.initialize<unsigned int>(context, numAtomBlocks, "blockSortKeys");
         sortedBlockCenter.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockCenter");
         sortedBlockBoundingBox.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockBoundingBox");
         numBlockSizes = min((context.getNumAtomBlocks()+63)/64, context.getNumThreadBlocks());
@@ -319,10 +326,21 @@ void CudaNonbondedUtilities::initialize(const System& system) {
         findBlockBoundsArgs.push_back(&blockBoundingBox.getDevicePointer());
         findBlockBoundsArgs.push_back(&rebuildNeighborList.getDevicePointer());
         findBlockBoundsArgs.push_back(&blockSizeRange.getDevicePointer());
+        checkRebuildArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
+        checkRebuildArgs.push_back(&oldPositions.getDevicePointer());
+        checkRebuildArgs.push_back(&interactionCount.getDevicePointer());
+        checkRebuildArgs.push_back(&rebuildNeighborList.getDevicePointer());
+        checkRebuildArgs.push_back(&forceRebuildNeighborList);
         computeSortKeysArgs.push_back(&blockBoundingBox.getDevicePointer());
-        computeSortKeysArgs.push_back(&sortedBlocks.getDevicePointer());
+        computeSortKeysArgs.push_back(useGatedBlockSort ? &blockSortKeys.getDevicePointer() : &sortedBlocks.getDevicePointer());
         computeSortKeysArgs.push_back(&blockSizeRange.getDevicePointer());
         computeSortKeysArgs.push_back(&numBlockSizes);
+        computeSortKeysArgs.push_back(&rebuildNeighborList.getDevicePointer());
+        if (useGatedBlockSort) {
+            sortBlockKeysArgs.push_back(&blockSortKeys.getDevicePointer());
+            sortBlockKeysArgs.push_back(&sortedBlocks.getDevicePointer());
+            sortBlockKeysArgs.push_back(&rebuildNeighborList.getDevicePointer());
+        }
         sortBoxDataArgs.push_back(&sortedBlocks.getDevicePointer());
         sortBoxDataArgs.push_back(&blockCenter.getDevicePointer());
         sortBoxDataArgs.push_back(&blockBoundingBox.getDevicePointer());
@@ -337,11 +355,7 @@ void CudaNonbondedUtilities::initialize(const System& system) {
             sortBoxDataArgs.push_back(context.getPeriodicBoxVecYPointer());
             sortBoxDataArgs.push_back(context.getPeriodicBoxVecZPointer());
         }
-        sortBoxDataArgs.push_back(&context.unwrap(context.getPosq()).getDevicePointer());
-        sortBoxDataArgs.push_back(&oldPositions.getDevicePointer());
-        sortBoxDataArgs.push_back(&interactionCount.getDevicePointer());
         sortBoxDataArgs.push_back(&rebuildNeighborList.getDevicePointer());
-        sortBoxDataArgs.push_back(&forceRebuildNeighborList);
         findInteractingBlocksArgs.push_back(context.getPeriodicBoxSizePointer());
         findInteractingBlocksArgs.push_back(context.getInvPeriodicBoxSizePointer());
         findInteractingBlocksArgs.push_back(context.getPeriodicBoxVecXPointer());
@@ -402,13 +416,20 @@ void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
     // Compute the neighbor list.
 
     context.executeKernel(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getNumAtomBlocks());
+    context.executeKernel(kernels.checkRebuildKernel, &checkRebuildArgs[0], context.getNumAtoms());
     context.executeKernel(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
-    blockSorter->sort(sortedBlocks);
+    if (useGatedBlockSort)
+        context.executeKernel(kernels.sortBlockKeysKernel, &sortBlockKeysArgs[0], context.getNumAtomBlocks(), 128);
+    else
+        blockSorter->sort(sortedBlocks);
     context.executeKernel(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms());
     context.executeKernel(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtoms(), 256);
     forceRebuildNeighborList = false;
-    interactionCount.download(pinnedCountBuffer, false);
-    cuEventRecord(downloadCountEvent, context.getCurrentStream());
+    if (!useLazyOverflowCheck || !countDownloadPending) {
+        interactionCount.download(pinnedCountBuffer, false);
+        cuEventRecord(downloadCountEvent, context.getCurrentStream());
+        countDownloadPending = true;
+    }
 }
 
 void CudaNonbondedUtilities::initParamArgs() {
@@ -431,10 +452,28 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
         if (!hasInitializedParams)
             initParamArgs();
         context.executeKernel(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        if (useLazyOverflowCheck && numTiles > 0) {
+            // Computes the interactions on the GPU if the neighbor list overflowed, and otherwise returns immediately.
+            CUfunction& fallback = (includeForces ? (includeEnergy ? kernels.fallbackForceEnergyKernel : kernels.fallbackForceKernel) : kernels.fallbackEnergyKernel);
+            if (fallback == NULL)
+                fallback = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy, true);
+            context.executeKernel(fallback, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        }
     }
     if (useNeighborList && numTiles > 0) {
-        cuEventSynchronize(downloadCountEvent);
-        updateNeighborListSize();
+        if (useLazyOverflowCheck) {
+            // The forces are correct even if the neighbor list overflowed, so there is no need to wait for the GPU.
+            // Check the counts whenever a download has completed, and enlarge the arrays if necessary.
+            if (countDownloadPending && cuEventQuery(downloadCountEvent) == CUDA_SUCCESS) {
+                countDownloadPending = false;
+                updateNeighborListSize();
+            }
+        }
+        else {
+            cuEventSynchronize(downloadCountEvent);
+            countDownloadPending = false;
+            updateNeighborListSize();
+        }
     }
 }
 
@@ -449,7 +488,13 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
         return false;
 
     // The most recent timestep had too many interactions to fit in the arrays.  Make the arrays bigger to prevent
-    // this from happening in the future.
+    // this from happening in the future.  If we didn't wait for the counts, kernels using the current arrays may
+    // still be queued, so let them finish before replacing the arrays.
+
+    if (useLazyOverflowCheck) {
+        string errorMessage = "Error synchronizing before resizing the neighbor list";
+        CHECK_RESULT(cuCtxSynchronize());
+    }
 
     if (pinnedCountBuffer[0] > maxTiles) {
         maxTiles = (unsigned int) (1.2*pinnedCountBuffer[0]);
@@ -474,7 +519,8 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
         findInteractingBlocksArgs[8] = &singlePairs.getDevicePointer();
     }
     forceRebuildNeighborList = true;
-    context.setForcesValid(false);
+    if (!useLazyOverflowCheck)
+        context.setForcesValid(false); // With the lazy check, the fallback kernel already computed correct forces.
     return true;
 }
 
@@ -503,6 +549,7 @@ void CudaNonbondedUtilities::createKernelsForGroups(int groups) {
     kernels.hasForces = (source.size() > 0);
     kernels.source = source;
     kernels.forceKernel = kernels.energyKernel = kernels.forceEnergyKernel = NULL;
+    kernels.fallbackForceKernel = kernels.fallbackEnergyKernel = kernels.fallbackForceEnergyKernel = NULL;
     if (useCutoff) {
         double paddedCutoff = padCutoff(maxCutoff);
         map<string, string> defines;
@@ -528,14 +575,16 @@ void CudaNonbondedUtilities::createKernelsForGroups(int groups) {
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
         CUmodule interactingBlocksProgram = context.createModule(CudaKernelSources::vectorOps+CudaKernelSources::findInteractingBlocks, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
+        kernels.checkRebuildKernel = context.getKernel(interactingBlocksProgram, "checkRebuildNeighborList");
         kernels.computeSortKeysKernel = context.getKernel(interactingBlocksProgram, "computeSortKeys");
+        kernels.sortBlockKeysKernel = context.getKernel(interactingBlocksProgram, "sortBlockKeys");
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
         kernels.findInteractingBlocksKernel = context.getKernel(interactingBlocksProgram, "findBlocksWithInteractions");
     }
     groupKernels[groups] = kernels;
 }
 
-CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy) {
+CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy, bool overflowFallback) {
     map<string, string> replacements;
     replacements["COMPUTE_INTERACTION"] = source;
     const string suffixes[] = {"x", "y", "z", "w"};
@@ -677,7 +726,9 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
         defines["USE_EXCLUSIONS"] = "1";
     if (isSymmetric)
         defines["USE_SYMMETRIC"] = "1";
-    if (useNeighborList)
+    if (overflowFallback)
+        defines["OVERFLOW_FALLBACK"] = "1";
+    else if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
     defines["ENABLE_SHUFFLE"] = "1";
     if (includeForces)

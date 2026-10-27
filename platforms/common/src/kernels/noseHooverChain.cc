@@ -46,6 +46,96 @@ KERNEL void propagateNoseHooverChain(GLOBAL mixed2* RESTRICT chainData, GLOBAL c
 }
 
 
+#ifndef MAX_FAST_CHAIN_LENGTH
+#define MAX_FAST_CHAIN_LENGTH 8
+#endif
+
+/**
+ * Same as propagateNoseHooverChain, but for chains of at most MAX_FAST_CHAIN_LENGTH beads.  The loops are fully
+ * unrolled against the compile time bound so the chain state lives in registers instead of global memory, which
+ * makes this single threaded kernel limited by arithmetic rather than by memory latency.
+ */
+KERNEL void propagateNoseHooverChainFast(GLOBAL mixed2* RESTRICT chainData, GLOBAL const mixed2 * RESTRICT energySum, GLOBAL mixed2* RESTRICT scaleFactor,
+                                         GLOBAL mixed* RESTRICT chainMasses, GLOBAL mixed* RESTRICT chainForces, int chainType, int chainLength, int numMTS,
+                                         int numDOFs, float timeStep, mixed kT, float frequency){
+    const mixed kineticEnergy = chainType == 0 ? energySum[0].x : energySum[0].y;
+    mixed scale = 1;
+    if(kineticEnergy < 1e-8) return;
+    mixed pos[MAX_FAST_CHAIN_LENGTH], vel[MAX_FAST_CHAIN_LENGTH], masses[MAX_FAST_CHAIN_LENGTH], forces[MAX_FAST_CHAIN_LENGTH];
+#pragma unroll
+    for (int bead = 0; bead < MAX_FAST_CHAIN_LENGTH; ++bead) {
+        if (bead < chainLength) {
+            mixed2 data = chainData[bead];
+            pos[bead] = data.x;
+            vel[bead] = data.y;
+            masses[bead] = kT / (frequency * frequency);
+        }
+    }
+    masses[0] *= numDOFs;
+    mixed KE2 = 2.0f * kineticEnergy;
+    mixed timeOverMTS = timeStep / numMTS;
+    forces[0] = (KE2 - numDOFs * kT) / masses[0];
+#pragma unroll
+    for (int bead = 0; bead < MAX_FAST_CHAIN_LENGTH - 1; ++bead) {
+        if (bead < chainLength - 1)
+            forces[bead + 1] = (masses[bead] * vel[bead] * vel[bead] - kT) / masses[bead + 1];
+    }
+    for (int mts = 0; mts < numMTS; ++mts) {
+        BEGIN_YS_LOOP
+            mixed wdt = ys * timeOverMTS;
+#pragma unroll
+            for (int bead = MAX_FAST_CHAIN_LENGTH - 1; bead >= 0; --bead) {
+                if (bead == chainLength - 1)
+                    vel[bead] += 0.5f * wdt * forces[bead];
+            }
+#pragma unroll
+            for (int bead = MAX_FAST_CHAIN_LENGTH - 2; bead >= 0; --bead) {
+                if (bead < chainLength - 1) {
+                    mixed aa = exp(-0.25f * wdt * vel[bead + 1]);
+                    vel[bead] = aa * (vel[bead] * aa + 0.5f * wdt * forces[bead]);
+                }
+            }
+            // update particle velocities
+            scale *= (mixed) exp(-wdt * vel[0]);
+            // update the thermostat positions
+#pragma unroll
+            for (int bead = 0; bead < MAX_FAST_CHAIN_LENGTH; ++bead) {
+                if (bead < chainLength)
+                    pos[bead] += vel[bead] * wdt;
+            }
+            // update the forces
+            forces[0] = (scale * scale * KE2 - numDOFs * kT) / masses[0];
+            // update thermostat velocities
+#pragma unroll
+            for (int bead = 0; bead < MAX_FAST_CHAIN_LENGTH - 1; ++bead) {
+                if (bead < chainLength - 1) {
+                    mixed aa = exp(-0.25f * wdt * vel[bead + 1]);
+                    vel[bead] = aa * (aa * vel[bead] + 0.5f * wdt * forces[bead]);
+                    forces[bead + 1] = (masses[bead] * vel[bead] * vel[bead] - kT) / masses[bead + 1];
+                }
+            }
+#pragma unroll
+            for (int bead = MAX_FAST_CHAIN_LENGTH - 1; bead >= 0; --bead) {
+                if (bead == chainLength - 1)
+                    vel[bead] += 0.5f * wdt * forces[bead];
+            }
+        END_YS_LOOP
+    } // MTS loop
+#pragma unroll
+    for (int bead = 0; bead < MAX_FAST_CHAIN_LENGTH; ++bead) {
+        if (bead < chainLength) {
+            chainData[bead] = make_mixed2(pos[bead], vel[bead]);
+            chainMasses[bead] = masses[bead];
+            chainForces[bead] = forces[bead];
+        }
+    }
+    if (chainType == 0) {
+        scaleFactor[0].x = scale;
+    } else {
+        scaleFactor[0].y = scale;
+    }
+}
+
 /**
  * Compute total (potential + kinetic) energy of the Nose-Hoover beads
  */
@@ -64,8 +154,30 @@ KERNEL void computeHeatBathEnergy(GLOBAL mixed* RESTRICT heatBathEnergy, int cha
     }
 }
 
+/**
+ * Sum a pair of energies over the work group.  The result is valid in thread 0.  Must be called by all threads
+ * in a work group of size WORK_GROUP_SIZE.
+ */
+DEVICE mixed2 workGroupSumEnergyPair(mixed2 energy, LOCAL_ARG mixed2* tempBuffer) {
+    tempBuffer[LOCAL_ID] = energy;
+    for (int i = 1; i < WORK_GROUP_SIZE; i *= 2) {
+        SYNC_THREADS;
+        if (LOCAL_ID%(i*2) == 0 && LOCAL_ID+i < WORK_GROUP_SIZE) {
+            tempBuffer[LOCAL_ID].x += tempBuffer[LOCAL_ID+i].x;
+            tempBuffer[LOCAL_ID].y += tempBuffer[LOCAL_ID+i].y;
+        }
+    }
+    SYNC_THREADS;
+    return tempBuffer[0];
+}
+
+/**
+ * Compute the kinetic energy of individually thermostated atoms.  Each work group writes one partial sum to
+ * energyBuffer[GROUP_ID], so this must be launched with work groups of size WORK_GROUP_SIZE.
+ */
 KERNEL void computeAtomsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int numAtoms,
                                       GLOBAL const mixed4* RESTRICT velm, GLOBAL const int *RESTRICT atoms){
+    LOCAL mixed2 tempBuffer[WORK_GROUP_SIZE];
     mixed2 energy = make_mixed2(0,0);
     int index = GLOBAL_ID;
     while (index < numAtoms){
@@ -75,11 +187,14 @@ KERNEL void computeAtomsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int
         energy.x += 0.5f * mass * (v.x*v.x + v.y*v.y + v.z*v.z);
         index += GLOBAL_SIZE;
     }
-    energyBuffer[GLOBAL_ID] = energy;
+    energy = workGroupSumEnergyPair(energy, tempBuffer);
+    if (LOCAL_ID == 0)
+        energyBuffer[GROUP_ID] = energy;
 }
 
 KERNEL void computePairsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int numPairs,
                                       GLOBAL const mixed4* RESTRICT velm, GLOBAL const int2 *RESTRICT pairs){
+    LOCAL mixed2 tempBuffer[WORK_GROUP_SIZE];
     mixed2 energy = make_mixed2(0,0);
     int index = GLOBAL_ID;
     while (index < numPairs){
@@ -103,8 +218,11 @@ KERNEL void computePairsKineticEnergy(GLOBAL mixed2 * RESTRICT energyBuffer, int
         index += GLOBAL_SIZE;
     }
     // The atoms version of this has been called already, so accumulate instead of assigning here
-    energyBuffer[GLOBAL_ID].x += energy.x;
-    energyBuffer[GLOBAL_ID].y += energy.y;
+    energy = workGroupSumEnergyPair(energy, tempBuffer);
+    if (LOCAL_ID == 0) {
+        energyBuffer[GROUP_ID].x += energy.x;
+        energyBuffer[GROUP_ID].y += energy.y;
+    }
 }
 
 KERNEL void scaleAtomsVelocities(GLOBAL mixed2* RESTRICT scaleFactor, int numAtoms,

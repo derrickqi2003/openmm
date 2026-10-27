@@ -62,24 +62,28 @@ void CommonIntegrateNoseHooverStepKernel::initialize(const System& system, const
     defines["END_YS_LOOP"] = "}";
     program = cc.compileProgram(CommonKernelSources::noseHooverChain, defines);
     propagateKernels[1] = program->createKernel("propagateNoseHooverChain");
+    propagateFastKernels[1] = program->createKernel("propagateNoseHooverChainFast");
 
     defines["BEGIN_YS_LOOP"] = "const real arr[3] = {0.828981543588751, -0.657963087177502, 0.828981543588751};"
                                "for(int i=0;i<3;++i) {"
                                "const real ys = arr[i];";
     program = cc.compileProgram(CommonKernelSources::noseHooverChain, defines);
     propagateKernels[3] = program->createKernel("propagateNoseHooverChain");
+    propagateFastKernels[3] = program->createKernel("propagateNoseHooverChainFast");
 
     defines["BEGIN_YS_LOOP"] = "const real arr[5] = {0.2967324292201065, 0.2967324292201065, -0.186929716880426, 0.2967324292201065, 0.2967324292201065};"
                                "for(int i=0;i<5;++i) {"
                                "const real ys = arr[i];";
     program = cc.compileProgram(CommonKernelSources::noseHooverChain, defines);
     propagateKernels[5] = program->createKernel("propagateNoseHooverChain");
+    propagateFastKernels[5] = program->createKernel("propagateNoseHooverChainFast");
 
     defines["BEGIN_YS_LOOP"] = "const real arr[7] = {0.784513610477560, 0.235573213359357, -1.17767998417887, 1.31518632068391,-1.17767998417887, 0.235573213359357, 0.784513610477560};"
                                "for(int i=0;i<7;++i) {"
                                "const real ys = arr[i];";
     program = cc.compileProgram(CommonKernelSources::noseHooverChain, defines);
     propagateKernels[7] = program->createKernel("propagateNoseHooverChain");
+    propagateFastKernels[7] = program->createKernel("propagateNoseHooverChainFast");
     program = cc.compileProgram(CommonKernelSources::noseHooverChain, defines);
     reduceEnergyKernel = program->createKernel("reduceEnergyPair");
 
@@ -88,7 +92,9 @@ void CommonIntegrateNoseHooverStepKernel::initialize(const System& system, const
     computePairsKineticEnergyKernel = program->createKernel("computePairsKineticEnergy");
     scaleAtomsVelocitiesKernel = program->createKernel("scaleAtomsVelocities");
     scalePairsVelocitiesKernel = program->createKernel("scalePairsVelocities");
-    int energyBufferSize = cc.getEnergyBuffer().getSize();
+    // The kinetic energy kernels write one partial sum per work group, and never launch more than
+    // getNumThreadBlocks() groups.
+    int energyBufferSize = cc.getNumThreadBlocks();
     if (cc.getUseDoublePrecision() || cc.getUseMixedPrecision())
         energyBuffer.initialize<mm_double2>(cc, energyBufferSize, "energyBuffer");
     else
@@ -342,19 +348,23 @@ std::pair<double, double> CommonIntegrateNoseHooverStepKernel::propagateChain(Co
 
     if (!hasInitializedPropagateKernel) {
         hasInitializedPropagateKernel = true;
-        propagateKernels[numYS]->addArg(); // ChainState
-        propagateKernels[numYS]->addArg(kineticEnergyBuffer);
-        propagateKernels[numYS]->addArg(scaleFactorBuffer);
-        propagateKernels[numYS]->addArg(chainMasses);
-        propagateKernels[numYS]->addArg(chainForces);
-        propagateKernels[numYS]->addArg(); // ChainType
-        propagateKernels[numYS]->addArg(chainLength);
-        propagateKernels[numYS]->addArg(numMTS);
-        propagateKernels[numYS]->addArg(); // numDoFs
-        propagateKernels[numYS]->addArg((float)timeStep);
-        propagateKernels[numYS]->addArg(); // kT
-        propagateKernels[numYS]->addArg(); // frequency
+        for (ComputeKernel kernel : {propagateKernels[numYS], propagateFastKernels[numYS]}) {
+            kernel->addArg(); // ChainState
+            kernel->addArg(kineticEnergyBuffer);
+            kernel->addArg(scaleFactorBuffer);
+            kernel->addArg(chainMasses);
+            kernel->addArg(chainForces);
+            kernel->addArg(); // ChainType
+            kernel->addArg(chainLength);
+            kernel->addArg(numMTS);
+            kernel->addArg(); // numDoFs
+            kernel->addArg((float)timeStep);
+            kernel->addArg(); // kT
+            kernel->addArg(); // frequency
+        }
     }
+    // Must match MAX_FAST_CHAIN_LENGTH in noseHooverChain.cc.
+    ComputeKernel propagateKernel = (chainLength <= 8 ? propagateFastKernels[numYS] : propagateKernels[numYS]);
 
     if (nAtoms) {
         int chainType = 0;
@@ -362,16 +372,16 @@ std::pair<double, double> CommonIntegrateNoseHooverStepKernel::propagateChain(Co
         float frequency = nhc.getCollisionFrequency();
         double kT = BOLTZ * temperature;
         int numDOFs = nhc.getNumDegreesOfFreedom();
-        propagateKernels[numYS]->setArg(0, chainState[2*chainID]);
-        propagateKernels[numYS]->setArg(5, chainType);
-        propagateKernels[numYS]->setArg(8, numDOFs);
+        propagateKernel->setArg(0, chainState[2*chainID]);
+        propagateKernel->setArg(5, chainType);
+        propagateKernel->setArg(8, numDOFs);
         if (useDouble) {
-            propagateKernels[numYS]->setArg(10, kT);
+            propagateKernel->setArg(10, kT);
         } else {
-            propagateKernels[numYS]->setArg(10, (float)kT);
+            propagateKernel->setArg(10, (float)kT);
         }
-        propagateKernels[numYS]->setArg(11, frequency);
-        propagateKernels[numYS]->execute(1, 1);
+        propagateKernel->setArg(11, frequency);
+        propagateKernel->execute(1, 1);
     }
     if (nPairs) {
         int chainType = 1;
@@ -379,16 +389,16 @@ std::pair<double, double> CommonIntegrateNoseHooverStepKernel::propagateChain(Co
         float relativeFrequency = nhc.getRelativeCollisionFrequency();
         double kT = BOLTZ * relativeTemperature;
         int ndf = 3*nPairs;
-        propagateKernels[numYS]->setArg(0, chainState[2*chainID+1]);
-        propagateKernels[numYS]->setArg(5, chainType);
-        propagateKernels[numYS]->setArg(8, ndf);
+        propagateKernel->setArg(0, chainState[2*chainID+1]);
+        propagateKernel->setArg(5, chainType);
+        propagateKernel->setArg(8, ndf);
         if (useDouble) {
-            propagateKernels[numYS]->setArg(10, kT);
+            propagateKernel->setArg(10, kT);
         } else {
-            propagateKernels[numYS]->setArg(10, (float)kT);
+            propagateKernel->setArg(10, (float)kT);
         }
-        propagateKernels[numYS]->setArg(11, relativeFrequency);
-        propagateKernels[numYS]->execute(1, 1);
+        propagateKernel->setArg(11, relativeFrequency);
+        propagateKernel->execute(1, 1);
     }
     return {0, 0};
 }
@@ -546,12 +556,12 @@ std::pair<double, double> CommonIntegrateNoseHooverStepKernel::computeMaskedKine
     if (nAtoms) {
         computeAtomsKineticEnergyKernel->setArg(1, nAtoms);
         computeAtomsKineticEnergyKernel->setArg(3, atomlists[chainID]);
-        computeAtomsKineticEnergyKernel->execute(nAtoms);
+        computeAtomsKineticEnergyKernel->execute(nAtoms, workGroupSize);
     }
     if (nPairs) {
         computePairsKineticEnergyKernel->setArg(1, nPairs);
         computePairsKineticEnergyKernel->setArg(3, pairlists[chainID]);
-        computePairsKineticEnergyKernel->execute(nPairs);
+        computePairsKineticEnergyKernel->execute(nPairs, workGroupSize);
     }
     reduceEnergyKernel->execute(workGroupSize, workGroupSize);
 
