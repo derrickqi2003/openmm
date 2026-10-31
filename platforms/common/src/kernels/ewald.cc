@@ -50,7 +50,8 @@ KERNEL void calculateEwaldCosSinSums(GLOBAL mixed* RESTRICT energyBuffer, GLOBAL
  * previous routine.
  */
 
-KERNEL void calculateEwaldForces(GLOBAL mm_long* RESTRICT forceBuffers, GLOBAL const real4* RESTRICT posq, GLOBAL const real2* RESTRICT cosSinSum, real4 periodicBoxSize) {
+KERNEL void calculateEwaldForces(GLOBAL mm_long* RESTRICT forceBuffers, GLOBAL const real4* RESTRICT posq, GLOBAL const real2* RESTRICT cosSinSum, real4 periodicBoxSize,
+        real forceScale) {
     unsigned int atom = GLOBAL_ID;
     real3 reciprocalBoxSize = make_real3(2*M_PI/periodicBoxSize.x, 2*M_PI/periodicBoxSize.y, 2*M_PI/periodicBoxSize.z);
     real reciprocalCoefficient = ONE_4PI_EPS0*4*M_PI/(periodicBoxSize.x*periodicBoxSize.y*periodicBoxSize.z);
@@ -89,6 +90,7 @@ KERNEL void calculateEwaldForces(GLOBAL mm_long* RESTRICT forceBuffers, GLOBAL c
 
         // Record the force on the atom.
 
+        force *= forceScale;
         forceBuffers[atom] += realToFixedPoint(force.x);
         forceBuffers[atom+PADDED_NUM_ATOMS] += realToFixedPoint(force.y);
         forceBuffers[atom+2*PADDED_NUM_ATOMS] += realToFixedPoint(force.z);

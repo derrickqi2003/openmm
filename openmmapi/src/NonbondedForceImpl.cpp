@@ -141,7 +141,7 @@ void NonbondedForceImpl::initialize(ContextImpl& context) {
 
 double NonbondedForceImpl::calcForcesAndEnergy(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     bool includeDirect = (includeDirectSpace && (groups&(1<<forceGroup)) != 0);
-    bool includeReciprocal = ((groups&(1<<recipForceGroup)) != 0);
+    bool includeReciprocal = ((groups&(1<<recipForceGroup)) != 0 && context.getReciprocalSpaceForceScale() != 0.0);
     return kernel.getAs<CalcNonbondedForceKernel>().execute(context, includeForces, includeEnergy, includeDirect, includeReciprocal);
 }
 

@@ -972,9 +972,10 @@ public:
 private:
     ComputeContext& cc;
     double prevTemp, prevFriction, prevStepSize;
-    bool hasInitializedKernels;
-    ComputeArray params, oldDelta;
-    ComputeKernel kernel1, kernel2, kernel3;
+    bool hasInitializedKernels, useClusterKernel;
+    int numClusterItems;
+    ComputeArray params, oldDelta, freeAtoms, unusedClusterArray;
+    ComputeKernel kernel1, kernel2, kernel3, clusterKernel;
 };
 
 /**

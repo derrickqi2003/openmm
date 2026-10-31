@@ -260,6 +260,9 @@ KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ul
 #else
         GLOBAL const real* RESTRICT charges
 #endif
+#ifdef USE_FORCE_SCALE
+        , real forceScale
+#endif
         ) {
     real3 data[PME_ORDER];
     real3 ddata[PME_ORDER];
@@ -340,6 +343,9 @@ KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ul
                 }
             }
         }
+#ifdef USE_FORCE_SCALE
+        q *= forceScale;
+#endif
         real forceX = -q*(force.x*GRID_SIZE_X*recipBoxVecX.x);
         real forceY = -q*(force.x*GRID_SIZE_X*recipBoxVecY.x+force.y*GRID_SIZE_Y*recipBoxVecY.y);
         real forceZ = -q*(force.x*GRID_SIZE_X*recipBoxVecZ.x+force.y*GRID_SIZE_Y*recipBoxVecZ.y+force.z*GRID_SIZE_Z*recipBoxVecZ.z);

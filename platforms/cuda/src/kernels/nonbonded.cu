@@ -367,6 +367,115 @@ extern "C" __global__ void computeNonbonded(
                 real4 blockCenterX = blockCenter[x];
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, blockCenterX)
                 APPLY_PERIODIC_TO_POS_WITH_CENTER(shflPosq, blockCenterX)
+#ifdef TWO_ATOMS_PER_LANE
+                // The warp shuffles that pass the tile's atoms from lane to lane limit the loop below, more than the
+                // arithmetic does.  So here each lane takes two atoms of block x, its own and the one 16 lanes away,
+                // and each half of the warp passes around 16 of the tile's atoms: every pair is still computed once,
+                // with half as many shuffles.  At the end each lane adds the force its partner computed on its atom.
+
+                const int partnerLane = tgx^16;
+                const int rotateSource = (tgx&16)|((tgx+1)&15);
+                const unsigned int partnerAtom1 = atom1^16;
+                const real4 partnerPosq1 = make_real4(real_shfl(posq1.x, partnerLane), real_shfl(posq1.y, partnerLane),
+                        real_shfl(posq1.z, partnerLane), real_shfl(posq1.w, partnerLane));
+                LOAD_PARTNER_PARAMETERS
+                real3 partnerForce = make_real3(0);
+                __syncwarp();
+                unsigned int tj = tgx;
+                for (j = 0; j < TILE_SIZE/2; j++) {
+                    int atom2 = atomIndices[tbx+tj];
+                    real4 posq2 = shflPosq;
+                    LOAD_ATOM2_PARAMETERS
+                    {
+                        // The lane's own atom of block x.
+
+                        real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
+                        real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+                        real invR = RSQRT(r2);
+                        real r = r2*invR;
+#ifdef USE_SYMMETRIC
+                        real dEdR = 0.0f;
+#else
+                        real3 dEdR1 = make_real3(0);
+                        real3 dEdR2 = make_real3(0);
+#endif
+#ifdef USE_EXCLUSIONS
+                        bool isExcluded = (atom1 >= NUM_ATOMS || atom2 >= NUM_ATOMS);
+#endif
+                        real tempEnergy = 0.0f;
+                        const real interactionScale = 1.0f;
+                        COMPUTE_INTERACTION
+                        energy += tempEnergy;
+#ifdef INCLUDE_FORCES
+#ifdef USE_SYMMETRIC
+                        delta *= dEdR;
+                        force.x -= delta.x;
+                        force.y -= delta.y;
+                        force.z -= delta.z;
+                        shflForce.x += delta.x;
+                        shflForce.y += delta.y;
+                        shflForce.z += delta.z;
+#else
+                        force.x -= dEdR1.x;
+                        force.y -= dEdR1.y;
+                        force.z -= dEdR1.z;
+                        shflForce.x += dEdR2.x;
+                        shflForce.y += dEdR2.y;
+                        shflForce.z += dEdR2.z;
+#endif
+#endif
+                    }
+                    {
+                        // The atom of block x held by the lane 16 away.
+
+                        const unsigned int atom1 = partnerAtom1;
+                        const real4 posq1 = partnerPosq1;
+                        USE_PARTNER_PARAMETERS
+                        real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
+                        real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+                        real invR = RSQRT(r2);
+                        real r = r2*invR;
+#ifdef USE_SYMMETRIC
+                        real dEdR = 0.0f;
+#else
+                        real3 dEdR1 = make_real3(0);
+                        real3 dEdR2 = make_real3(0);
+#endif
+#ifdef USE_EXCLUSIONS
+                        bool isExcluded = (atom1 >= NUM_ATOMS || atom2 >= NUM_ATOMS);
+#endif
+                        real tempEnergy = 0.0f;
+                        const real interactionScale = 1.0f;
+                        COMPUTE_INTERACTION
+                        energy += tempEnergy;
+#ifdef INCLUDE_FORCES
+#ifdef USE_SYMMETRIC
+                        delta *= dEdR;
+                        partnerForce.x -= delta.x;
+                        partnerForce.y -= delta.y;
+                        partnerForce.z -= delta.z;
+                        shflForce.x += delta.x;
+                        shflForce.y += delta.y;
+                        shflForce.z += delta.z;
+#else
+                        partnerForce.x -= dEdR1.x;
+                        partnerForce.y -= dEdR1.y;
+                        partnerForce.z -= dEdR1.z;
+                        shflForce.x += dEdR2.x;
+                        shflForce.y += dEdR2.y;
+                        shflForce.z += dEdR2.z;
+#endif
+#endif
+                    }
+                    SHUFFLE_HALF_WARP_DATA
+                    tj = (tj&16)|((tj+1)&15);
+                }
+#ifdef INCLUDE_FORCES
+                force.x += real_shfl(partnerForce.x, partnerLane);
+                force.y += real_shfl(partnerForce.y, partnerLane);
+                force.z += real_shfl(partnerForce.z, partnerLane);
+#endif
+#else
                 unsigned int tj = tgx;
                 for (j = 0; j < TILE_SIZE; j++) {
                     int atom2 = tbx+tj;
@@ -411,6 +520,7 @@ extern "C" __global__ void computeNonbonded(
                     SHUFFLE_WARP_DATA
                     tj = (tj + 1) & (TILE_SIZE - 1);
                 }
+#endif // TWO_ATOMS_PER_LANE
             }
             else
 #endif

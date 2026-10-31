@@ -32,6 +32,7 @@
 #include "openmm/common/ComputeQueue.h"
 #include "openmm/common/ComputeSort.h"
 #include "openmm/common/FFT3D.h"
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <utility>
@@ -45,7 +46,13 @@ namespace OpenMM {
 class CommonCalcNonbondedForceKernel : public CalcNonbondedForceKernel {
 public:
     CommonCalcNonbondedForceKernel(std::string name, const Platform& platform, ComputeContext& cc, const System& system) : CalcNonbondedForceKernel(name, platform),
-            hasInitializedKernel(false), cc(cc), pmeio(NULL), stepsToSort(0) {
+            hasInitializedKernel(false), cc(cc), pmeio(NULL), stepsToSort(0), hasExclusionCorrection(false), useSeparateExclusionCorrection(false) {
+        // The atoms are sorted for PME only to write the grid more efficiently.  Atoms move much less than a grid cell
+        // per step, so the order can be reused for longer.  OPENMM_PME_SORT_INTERVAL sets the number of evaluations
+        // between sorts; otherwise the context may choose one, and if it doesn't, the default below is used.
+
+        const char* interval = getenv("OPENMM_PME_SORT_INTERVAL");
+        pmeSortInterval = (interval != NULL && atoi(interval) > 0 ? atoi(interval) : cc.getPmeSortInterval());
     }
     ~CommonCalcNonbondedForceKernel();
     /**
@@ -142,6 +149,7 @@ private:
     ComputeArray pmeAtomGridIndex;
     ComputeArray pmeEnergyBuffer;
     ComputeArray chargeBuffer;
+    ComputeArray exclusionsInBonded;
     ComputeSort sort;
     ComputeQueue pmeQueue;
     ComputeEvent pmeSyncEvent, paramsSyncEvent;
@@ -157,7 +165,9 @@ private:
     ComputeKernel pmeConvolutionKernel, pmeDispersionConvolutionKernel;
     ComputeKernel pmeEvalEnergyKernel, pmeDispersionEvalEnergyKernel;
     ComputeKernel pmeInterpolateForceKernel, pmeDispersionInterpolateForceKernel;
+    ComputeKernel exclusionCorrectionKernel;
     std::map<std::string, std::string> pmeDefines;
+    std::string exclusionCorrectionSource;
     std::vector<std::pair<int, int> > exceptionAtoms;
     std::vector<std::string> paramNames;
     std::map<std::string, int> paramIndices;
@@ -167,9 +177,13 @@ private:
     double ewaldSelfEnergy, dispersionCoefficient, alpha, dispersionAlpha, totalCharge;
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
-    int stepsToSort;
+    int stepsToSort, pmeSortInterval;
     bool usePmeQueue, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
+    // The reciprocal space correction for excluded pairs is normally part of the bonded kernel.  Once a force
+    // calculation scales reciprocal space (multiple time stepping), it moves to a kernel of its own for the rest
+    // of the Context's life, so it can be scaled with reciprocal space.
+    bool hasExclusionCorrection, useSeparateExclusionCorrection;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;
 };

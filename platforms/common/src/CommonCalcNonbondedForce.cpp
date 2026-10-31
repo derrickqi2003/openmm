@@ -169,7 +169,7 @@ public:
     SyncQueuePreComputation(ComputeContext& cc, ComputeQueue queue, ComputeEvent event, int forceGroup) : cc(cc), queue(queue), event(event), forceGroup(forceGroup) {
     }
     void computeForceAndEnergy(bool includeForces, bool includeEnergy, int groups) {
-        if ((groups&(1<<forceGroup)) != 0) {
+        if ((groups&(1<<forceGroup)) != 0 && cc.getContextImpl()->getReciprocalSpaceForceScale() != 0.0) {
             event->enqueue();
             event->queueWait(queue);
         }
@@ -193,7 +193,7 @@ public:
         addEnergyKernel->addArg((int) pmeEnergyBuffer.getSize());
     }
     double computeForceAndEnergy(bool includeForces, bool includeEnergy, int groups) {
-        if ((groups&(1<<forceGroup)) != 0) {
+        if ((groups&(1<<forceGroup)) != 0 && cc.getContextImpl()->getReciprocalSpaceForceScale() != 0.0) {
             event->queueWait(cc.getCurrentQueue());
             if (includeEnergy)
                 addEnergyKernel->execute(pmeEnergyBuffer.getSize());
@@ -415,6 +415,7 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
             pmeDefines["GRID_SIZE_Z"] = cc.intToString(gridSizeZ);
             pmeDefines["EPSILON_FACTOR"] = cc.doubleToString(sqrt(ONE_4PI_EPS0));
             pmeDefines["M_PI"] = cc.doubleToString(M_PI);
+            pmeDefines["USE_FORCE_SCALE"] = "1";
             if (useFixedPointChargeSpreading)
                 pmeDefines["USE_FIXED_POINT_CHARGE_SPREADING"] = "1";
             if (deviceIsCpu)
@@ -589,8 +590,21 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
             replacements["USE_PERIODIC"] = force.getExceptionsUsePeriodicBoundaryConditions() ? "1" : "0";
             if (doLJPME)
                 replacements["EWALD_DISPERSION_ALPHA"] = cc.doubleToString(dispersionAlpha);
-            if (force.getIncludeDirectSpace())
+            if (force.getIncludeDirectSpace()) {
+                exclusionsInBonded.initialize<int>(cc, 1, "exclusionsInBonded");
+                exclusionsInBonded.upload(vector<int>(1, 1));
+                replacements["EXCLUSIONS_ACTIVE"] = cc.getBondedUtilities().addArgument(exclusionsInBonded, "int")+"[0] != 0";
                 cc.getBondedUtilities().addInteraction(atoms, cc.replaceStrings(CommonKernelSources::pmeExclusions, replacements), force.getForceGroup());
+
+                // Keep the source for a separate kernel, in case multiple time stepping needs it.
+
+                replacements["PARAMS"] = "exclusionParamArray";
+                replacements["EXCLUSIONS_ACTIVE"] = "true";
+                map<string, string> kernelReplacements;
+                kernelReplacements["COMPUTE_EXCLUSION"] = cc.replaceStrings(CommonKernelSources::pmeExclusions, replacements);
+                exclusionCorrectionSource = cc.replaceStrings(CommonKernelSources::pmeExclusionCorrection, kernelReplacements);
+                hasExclusionCorrection = true;
+            }
         }
     }
 
@@ -763,6 +777,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
             ewaldForcesKernel->addArg(cc.getPosq());
             ewaldForcesKernel->addArg(cosSinSums);
             ewaldForcesKernel->addArg();
+            ewaldForcesKernel->addArg();
         }
         if (pmeGrid1.isInitialized()) {
             // Create kernels for Coulomb PME.
@@ -811,6 +826,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeInterpolateForceKernel->addArg();
             pmeInterpolateForceKernel->addArg(pmeAtomGridIndex);
             pmeInterpolateForceKernel->addArg(charges);
+            pmeInterpolateForceKernel->addArg();
             if (useFixedPointChargeSpreading) {
                 pmeFinishSpreadChargeKernel = program->createKernel("finishSpreadCharge");
                 pmeFinishSpreadChargeKernel->addArg(pmeGrid2);
@@ -872,6 +888,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                     pmeDispersionInterpolateForceKernel->addArg();
                 pmeDispersionInterpolateForceKernel->addArg(pmeAtomGridIndex);
                 pmeDispersionInterpolateForceKernel->addArg(sigmaEpsilon);
+                pmeDispersionInterpolateForceKernel->addArg();
                 if (useFixedPointChargeSpreading) {
                     pmeDispersionFinishSpreadChargeKernel = program->createKernel("finishSpreadCharge");
                     pmeDispersionFinishSpreadChargeKernel->addArg(pmeGrid2);
@@ -926,6 +943,43 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         recomputeParams = false;
     }
 
+    // An integrator using multiple time stepping may ask for reciprocal space forces to be scaled (or skipped, in
+    // which case includeReciprocal is false).  The correction for excluded pairs is then scaled with them.
+
+    double recipScale = context.getReciprocalSpaceForceScale();
+    if (recipScale != 1.0) {
+        if (pmeio != NULL)
+            throw OpenMMException("Scaling reciprocal space forces for multiple time stepping is not supported with CPU PME");
+        if (hasExclusionCorrection && !useSeparateExclusionCorrection) {
+            // Queue the change behind any force calculations still in progress, from memory that outlives them.
+
+            static const int zero = 0;
+            useSeparateExclusionCorrection = true;
+            exclusionsInBonded.uploadSubArray(&zero, 0, 1, false);
+            map<string, string> defines;
+            defines["PADDED_NUM_ATOMS"] = cc.intToString(cc.getPaddedNumAtoms());
+            ComputeProgram program = cc.compileProgram(exclusionCorrectionSource, defines);
+            exclusionCorrectionKernel = program->createKernel("computeExclusionCorrection");
+            exclusionCorrectionKernel->addArg(cc.getLongForceBuffer());
+            exclusionCorrectionKernel->addArg(cc.getEnergyBuffer());
+            exclusionCorrectionKernel->addArg(cc.getPosq());
+            exclusionCorrectionKernel->addArg(exclusionAtoms);
+            exclusionCorrectionKernel->addArg(exclusionParams);
+            exclusionCorrectionKernel->addArg((int) exclusionParams.getSize());
+            for (int i = 0; i < 7; i++)
+                exclusionCorrectionKernel->addArg();
+        }
+    }
+    if (useSeparateExclusionCorrection && (recipScale != 1.0 ? includeReciprocal : includeDirect)) {
+        setPeriodicBoxArgs(cc, exclusionCorrectionKernel, 6);
+        if (cc.getUseDoublePrecision())
+            exclusionCorrectionKernel->setArg(11, recipScale);
+        else
+            exclusionCorrectionKernel->setArg(11, (float) recipScale);
+        exclusionCorrectionKernel->setArg(12, (int) includeEnergy);
+        exclusionCorrectionKernel->execute(exclusionParams.getSize());
+    }
+
     // Do reciprocal space calculations.
 
     if (cosSinSums.isInitialized() && includeReciprocal) {
@@ -934,10 +988,12 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
         if (cc.getUseDoublePrecision()) {
             ewaldSumsKernel->setArg(3, mm_double4(a[0], b[1], c[2], 0));
             ewaldForcesKernel->setArg(3, mm_double4(a[0], b[1], c[2], 0));
+            ewaldForcesKernel->setArg(4, recipScale);
         }
         else {
             ewaldSumsKernel->setArg(3, mm_float4((float) a[0], (float) b[1], (float) c[2], 0));
             ewaldForcesKernel->setArg(3, mm_float4((float) a[0], (float) b[1], (float) c[2], 0));
+            ewaldForcesKernel->setArg(4, (float) recipScale);
         }
         ewaldSumsKernel->execute(cosSinSums.getSize());
         ewaldForcesKernel->execute(cc.getNumAtoms());
@@ -977,7 +1033,10 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 }
                 pmeGridIndexKernel->execute(cc.getNumAtoms());
                 sort->sort(pmeAtomGridIndex);
-                stepsToSort = (cc.getNumAtoms() > 15000) ? 1 : 3;
+                if (pmeSortInterval > 0)
+                    stepsToSort = pmeSortInterval-1;
+                else
+                    stepsToSort = (cc.getNumAtoms() > 15000) ? 1 : 3;
             }
             else
                 stepsToSort--;
@@ -1021,11 +1080,13 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeInterpolateForceKernel->setArg(8, recipBoxVectors[0]);
                 pmeInterpolateForceKernel->setArg(9, recipBoxVectors[1]);
                 pmeInterpolateForceKernel->setArg(10, recipBoxVectors[2]);
+                pmeInterpolateForceKernel->setArg(13, recipScale);
             }
             else {
                 pmeInterpolateForceKernel->setArg(8, recipBoxVectorsFloat[0]);
                 pmeInterpolateForceKernel->setArg(9, recipBoxVectorsFloat[1]);
                 pmeInterpolateForceKernel->setArg(10, recipBoxVectorsFloat[2]);
+                pmeInterpolateForceKernel->setArg(13, (float) recipScale);
             }
             if (deviceIsCpu)
                 pmeInterpolateForceKernel->execute(cc.getNumThreadBlocks(), 1);
@@ -1093,11 +1154,13 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
                 pmeDispersionInterpolateForceKernel->setArg(8, recipBoxVectors[0]);
                 pmeDispersionInterpolateForceKernel->setArg(9, recipBoxVectors[1]);
                 pmeDispersionInterpolateForceKernel->setArg(10, recipBoxVectors[2]);
+                pmeDispersionInterpolateForceKernel->setArg(13, recipScale);
             }
             else {
                 pmeDispersionInterpolateForceKernel->setArg(8, recipBoxVectorsFloat[0]);
                 pmeDispersionInterpolateForceKernel->setArg(9, recipBoxVectorsFloat[1]);
                 pmeDispersionInterpolateForceKernel->setArg(10, recipBoxVectorsFloat[2]);
+                pmeDispersionInterpolateForceKernel->setArg(13, (float) recipScale);
             }
             if (deviceIsCpu)
                 pmeDispersionInterpolateForceKernel->execute(cc.getNumThreadBlocks(), 1);

@@ -632,6 +632,8 @@ void CpuCalcNonbondedForceKernel::initialize(const System& system, const Nonbond
 }
 
 double CpuCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy, bool includeDirect, bool includeReciprocal) {
+    if (context.getReciprocalSpaceForceScale() != 1.0 && (nonbondedMethod == Ewald || nonbondedMethod == PME || nonbondedMethod == LJPME))
+        throw OpenMMException("The CPU platform does not support scaling reciprocal space forces for multiple time stepping");
     if (!hasInitializedPme) {
         hasInitializedPme = true;
         useOptimizedPme = false;

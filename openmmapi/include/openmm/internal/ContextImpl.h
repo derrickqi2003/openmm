@@ -215,6 +215,21 @@ public:
      */
     int& getLastForceGroups();
     /**
+     * Get the factor by which forces from the reciprocal space part of Ewald and PME are multiplied.  This is 1
+     * except during force calculations requested by an integrator that uses multiple time stepping: it sets 0 to
+     * omit reciprocal space, or the number of steps between evaluations to apply it as an impulse.  Whenever it is
+     * not 1, NonbondedForce also computes the reciprocal space correction for excluded pairs together with
+     * reciprocal space, so that the part being omitted or scaled varies smoothly with the coordinates.  The
+     * scale applies to forces only, never to energies.
+     */
+    double getReciprocalSpaceForceScale() const;
+    /**
+     * Set the factor by which forces from the reciprocal space part of Ewald and PME are multiplied.  See
+     * getReciprocalSpaceForceScale() for details.  Whoever sets a value other than 1 must restore it to 1 after
+     * the force calculation.
+     */
+    void setReciprocalSpaceForceScale(double scale);
+    /**
      * Calculate the kinetic energy of the system (in kJ/mol).
      */
     double calcKineticEnergy();
@@ -316,6 +331,7 @@ private:
     mutable std::vector<std::vector<int> > molecules;
     bool hasInitializedForces, hasSetPositions, integratorIsDeleted, hasMinimizeKernel;
     int lastForceGroups;
+    double reciprocalSpaceForceScale;
     Platform* platform;
     Kernel initializeForcesKernel, updateStateDataKernel, applyConstraintsKernel, virtualSitesKernel, minimizeKernel;
     void* platformData;

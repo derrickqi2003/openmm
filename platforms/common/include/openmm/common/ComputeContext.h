@@ -290,6 +290,33 @@ public:
         stepsSinceReorder = steps;
     }
     /**
+     * Get the number of time steps between periodic reorderings of the atoms.
+     */
+    int getReorderInterval() const {
+        return reorderInterval;
+    }
+    /**
+     * Set the number of time steps between periodic reorderings of the atoms.  The neighbor list can still force
+     * a reorder sooner, when its size grows.
+     */
+    void setReorderInterval(int interval) {
+        reorderInterval = interval;
+    }
+    /**
+     * Get the number of PME evaluations between sorts of the atoms by grid cell, or 0 to let the PME implementation
+     * choose.
+     */
+    int getPmeSortInterval() const {
+        return pmeSortInterval;
+    }
+    /**
+     * Set the number of PME evaluations between sorts of the atoms by grid cell, or 0 to let the PME implementation
+     * choose.  The order only affects how efficiently the grid is written.
+     */
+    void setPmeSortInterval(int interval) {
+        pmeSortInterval = interval;
+    }
+    /**
      * Get whether atoms were reordered during the most recent force/energy computation.
      */
     bool getAtomsWereReordered() const {
@@ -660,7 +687,7 @@ protected:
     void reorderAtomsImpl();
     const System& system;
     double time;
-    int numAtoms, paddedNumAtoms, computeForceCount, stepsSinceReorder;
+    int numAtoms, paddedNumAtoms, computeForceCount, stepsSinceReorder, reorderInterval, pmeSortInterval;
     int numAtomBlocks, numThreadBlocks;
     long long stepCount;
     bool useDoublePrecision, useMixedPrecision, boxIsTriclinic, hasAssignedPosqCharges;

@@ -1010,7 +1010,21 @@ double ReferenceCalcNonbondedForceKernel::execute(ContextImpl& context, bool inc
     }
     if (useSwitchingFunction)
         clj.setUseSwitchingFunction(switchingDistance);
-    clj.calculatePairIxn(numParticles, posData, particleParamArray, exclusions, forceData, includeEnergy ? &energy : NULL, includeDirect, includeReciprocal);
+    double recipScale = context.getReciprocalSpaceForceScale();
+    if (recipScale != 1.0 && (ewald || pme || ljpme)) {
+        // Multiple time stepping: scale reciprocal space and the correction for excluded pairs together.
+
+        clj.setExclusionsWithReciprocal(true);
+        clj.calculatePairIxn(numParticles, posData, particleParamArray, exclusions, forceData, includeEnergy ? &energy : NULL, includeDirect, false);
+        if (includeReciprocal) {
+            vector<Vec3> recipForces(forceData.size(), Vec3());
+            clj.calculatePairIxn(numParticles, posData, particleParamArray, exclusions, recipForces, includeEnergy ? &energy : NULL, false, true);
+            for (int i = 0; i < numParticles; i++)
+                forceData[i] += recipForces[i]*recipScale;
+        }
+    }
+    else
+        clj.calculatePairIxn(numParticles, posData, particleParamArray, exclusions, forceData, includeEnergy ? &energy : NULL, includeDirect, includeReciprocal);
     if (includeDirect) {
         ReferenceBondForce refBondForce;
         ReferenceLJCoulomb14 nonbonded14;

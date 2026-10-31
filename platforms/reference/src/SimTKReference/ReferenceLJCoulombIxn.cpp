@@ -48,7 +48,8 @@ using namespace OpenMM;
 
    --------------------------------------------------------------------------------------- */
 
-ReferenceLJCoulombIxn::ReferenceLJCoulombIxn() : cutoff(false), useSwitch(false), periodic(false), periodicExceptions(false), ewald(false), pme(false), ljpme(false) {
+ReferenceLJCoulombIxn::ReferenceLJCoulombIxn() : cutoff(false), useSwitch(false), periodic(false), periodicExceptions(false), exclusionsWithReciprocal(false),
+        ewald(false), pme(false), ljpme(false) {
 }
 
 /**---------------------------------------------------------------------------------------
@@ -169,6 +170,10 @@ void ReferenceLJCoulombIxn::setUseLJPME(double alpha, int meshSize[3]) {
 
 void ReferenceLJCoulombIxn::setPeriodicExceptions(bool periodic) {
     periodicExceptions = periodic;
+}
+
+void ReferenceLJCoulombIxn::setExclusionsWithReciprocal(bool withReciprocal) {
+    exclusionsWithReciprocal = withReciprocal;
 }
 
 /**---------------------------------------------------------------------------------------
@@ -370,96 +375,98 @@ void ReferenceLJCoulombIxn::calculateEwaldIxn(int numberOfAtoms, vector<Vec3>& a
     // SHORT-RANGE ENERGY AND FORCES
     // **************************************************************************************
 
-    if (!includeDirect)
-        return;
     double totalVdwEnergy            = 0.0f;
     double totalRealSpaceEwaldEnergy = 0.0f;
 
+    if (includeDirect) {
+        for (auto& pair : *neighborList) {
+            int ii = pair.first;
+            int jj = pair.second;
 
-    for (auto& pair : *neighborList) {
-        int ii = pair.first;
-        int jj = pair.second;
-
-        double deltaR[2][ReferenceForce::LastDeltaRIndex];
-        ReferenceForce::getDeltaRPeriodic(atomCoordinates[jj], atomCoordinates[ii], periodicBoxVectors, deltaR[0]);
-        double r         = deltaR[0][ReferenceForce::RIndex];
-        double inverseR  = 1.0/(deltaR[0][ReferenceForce::RIndex]);
-        double switchValue = 1, switchDeriv = 0;
-        if (useSwitch && r > switchingDistance) {
-            double t = (r-switchingDistance)/(cutoffDistance-switchingDistance);
-            switchValue = 1+t*t*t*(-10+t*(15-t*6));
-            switchDeriv = t*t*(-30+t*(60-t*30))/(cutoffDistance-switchingDistance);
-        }
-        double alphaR = alphaEwald * r;
+            double deltaR[2][ReferenceForce::LastDeltaRIndex];
+            ReferenceForce::getDeltaRPeriodic(atomCoordinates[jj], atomCoordinates[ii], periodicBoxVectors, deltaR[0]);
+            double r         = deltaR[0][ReferenceForce::RIndex];
+            double inverseR  = 1.0/(deltaR[0][ReferenceForce::RIndex]);
+            double switchValue = 1, switchDeriv = 0;
+            if (useSwitch && r > switchingDistance) {
+                double t = (r-switchingDistance)/(cutoffDistance-switchingDistance);
+                switchValue = 1+t*t*t*(-10+t*(15-t*6));
+                switchDeriv = t*t*(-30+t*(60-t*30))/(cutoffDistance-switchingDistance);
+            }
+            double alphaR = alphaEwald * r;
 
 
-        double dEdR = ONE_4PI_EPS0 * atomParameters[ii][QIndex] * atomParameters[jj][QIndex] * inverseR * inverseR * inverseR;
-        dEdR = dEdR * (erfc(alphaR) + 2 * alphaR * exp (- alphaR * alphaR) / SQRT_PI);
+            double dEdR = ONE_4PI_EPS0 * atomParameters[ii][QIndex] * atomParameters[jj][QIndex] * inverseR * inverseR * inverseR;
+            dEdR = dEdR * (erfc(alphaR) + 2 * alphaR * exp (- alphaR * alphaR) / SQRT_PI);
 
-        double sig = atomParameters[ii][SigIndex] +  atomParameters[jj][SigIndex];
-        double sig2 = inverseR*sig;
-        sig2 *= sig2;
-        double sig6 = sig2*sig2*sig2;
-        double eps = atomParameters[ii][EpsIndex]*atomParameters[jj][EpsIndex];
-        dEdR += switchValue*eps*(12.0*sig6 - 6.0)*sig6*inverseR*inverseR;
-        vdwEnergy = eps*(sig6-1.0)*sig6;
-
-        if (ljpme) {
-            double dalphaR   = alphaDispersionEwald * r;
-            double dar2 = dalphaR*dalphaR;
-            double dar4 = dar2*dar2;
-            double dar6 = dar4*dar2;
-            double inverseR2 = inverseR*inverseR;
-            double c6i = 8.0*pow(atomParameters[ii][SigIndex], 3.0) * atomParameters[ii][EpsIndex];
-            double c6j = 8.0*pow(atomParameters[jj][SigIndex], 3.0) * atomParameters[jj][EpsIndex];
-            // For the energies and forces, we first add the regular Lorentz−Berthelot terms.  The C12 term is treated as usual
-            // but we then subtract out (remembering that the C6 term is negative) the multiplicative C6 term that has been
-            // computed in real space.  Finally, we add a potential shift term to account for the difference between the LB
-            // and multiplicative functional forms at the cutoff.
-            double emult = c6i*c6j*inverseR2*inverseR2*inverseR2*(1.0 - EXP(-dar2) * (1.0 + dar2 + 0.5*dar4));
-            dEdR += 6.0*c6i*c6j*inverseR2*inverseR2*inverseR2*inverseR2*(1.0 - EXP(-dar2) * (1.0 + dar2 + 0.5*dar4 + dar6/6.0));
-
-            double inverseCut2 = 1.0/(cutoffDistance*cutoffDistance);
-            double inverseCut6 = inverseCut2*inverseCut2*inverseCut2;
-            sig2 = atomParameters[ii][SigIndex] +  atomParameters[jj][SigIndex];
+            double sig = atomParameters[ii][SigIndex] +  atomParameters[jj][SigIndex];
+            double sig2 = inverseR*sig;
             sig2 *= sig2;
-            sig6 = sig2*sig2*sig2;
-            // The additive part of the potential shift
-            double potentialshift = eps*(1.0-sig6*inverseCut6)*sig6*inverseCut6;
-            dalphaR   = alphaDispersionEwald * cutoffDistance;
-            dar2 = dalphaR*dalphaR;
-            dar4 = dar2*dar2;
-            // The multiplicative part of the potential shift
-            potentialshift -= c6i*c6j*inverseCut6*(1.0 - EXP(-dar2) * (1.0 + dar2 + 0.5*dar4));
-            vdwEnergy += emult + potentialshift;
+            double sig6 = sig2*sig2*sig2;
+            double eps = atomParameters[ii][EpsIndex]*atomParameters[jj][EpsIndex];
+            dEdR += switchValue*eps*(12.0*sig6 - 6.0)*sig6*inverseR*inverseR;
+            vdwEnergy = eps*(sig6-1.0)*sig6;
+
+            if (ljpme) {
+                double dalphaR   = alphaDispersionEwald * r;
+                double dar2 = dalphaR*dalphaR;
+                double dar4 = dar2*dar2;
+                double dar6 = dar4*dar2;
+                double inverseR2 = inverseR*inverseR;
+                double c6i = 8.0*pow(atomParameters[ii][SigIndex], 3.0) * atomParameters[ii][EpsIndex];
+                double c6j = 8.0*pow(atomParameters[jj][SigIndex], 3.0) * atomParameters[jj][EpsIndex];
+                // For the energies and forces, we first add the regular Lorentz−Berthelot terms.  The C12 term is treated as usual
+                // but we then subtract out (remembering that the C6 term is negative) the multiplicative C6 term that has been
+                // computed in real space.  Finally, we add a potential shift term to account for the difference between the LB
+                // and multiplicative functional forms at the cutoff.
+                double emult = c6i*c6j*inverseR2*inverseR2*inverseR2*(1.0 - EXP(-dar2) * (1.0 + dar2 + 0.5*dar4));
+                dEdR += 6.0*c6i*c6j*inverseR2*inverseR2*inverseR2*inverseR2*(1.0 - EXP(-dar2) * (1.0 + dar2 + 0.5*dar4 + dar6/6.0));
+
+                double inverseCut2 = 1.0/(cutoffDistance*cutoffDistance);
+                double inverseCut6 = inverseCut2*inverseCut2*inverseCut2;
+                sig2 = atomParameters[ii][SigIndex] +  atomParameters[jj][SigIndex];
+                sig2 *= sig2;
+                sig6 = sig2*sig2*sig2;
+                // The additive part of the potential shift
+                double potentialshift = eps*(1.0-sig6*inverseCut6)*sig6*inverseCut6;
+                dalphaR   = alphaDispersionEwald * cutoffDistance;
+                dar2 = dalphaR*dalphaR;
+                dar4 = dar2*dar2;
+                // The multiplicative part of the potential shift
+                potentialshift -= c6i*c6j*inverseCut6*(1.0 - EXP(-dar2) * (1.0 + dar2 + 0.5*dar4));
+                vdwEnergy += emult + potentialshift;
+            }
+
+            if (useSwitch) {
+                dEdR -= vdwEnergy*switchDeriv*inverseR;
+                vdwEnergy *= switchValue;
+            }
+
+            // accumulate forces
+
+            for (int kk = 0; kk < 3; kk++) {
+                double force  = dEdR*deltaR[0][kk];
+                forces[ii][kk]   += force;
+                forces[jj][kk]   -= force;
+            }
+
+            // accumulate energies
+
+            realSpaceEwaldEnergy        = ONE_4PI_EPS0*atomParameters[ii][QIndex]*atomParameters[jj][QIndex]*inverseR*erfc(alphaR);
+
+            totalVdwEnergy             += vdwEnergy;
+            totalRealSpaceEwaldEnergy  += realSpaceEwaldEnergy;
+
         }
 
-        if (useSwitch) {
-            dEdR -= vdwEnergy*switchDeriv*inverseR;
-            vdwEnergy *= switchValue;
-        }
-
-        // accumulate forces
-
-        for (int kk = 0; kk < 3; kk++) {
-            double force  = dEdR*deltaR[0][kk];
-            forces[ii][kk]   += force;
-            forces[jj][kk]   -= force;
-        }
-
-        // accumulate energies
-
-        realSpaceEwaldEnergy        = ONE_4PI_EPS0*atomParameters[ii][QIndex]*atomParameters[jj][QIndex]*inverseR*erfc(alphaR);
-
-        totalVdwEnergy             += vdwEnergy;
-        totalRealSpaceEwaldEnergy  += realSpaceEwaldEnergy;
-
+        if (totalEnergy)
+            *totalEnergy += totalRealSpaceEwaldEnergy + totalVdwEnergy;
     }
 
-    if (totalEnergy)
-        *totalEnergy += totalRealSpaceEwaldEnergy + totalVdwEnergy;
-
     // Now subtract off the exclusions, since they were implicitly included in the reciprocal space sum.
+
+    if (!(exclusionsWithReciprocal ? includeReciprocal : includeDirect))
+        return;
 
     double totalExclusionEnergy = 0.0f;
     const double TWO_OVER_SQRT_PI = 2/sqrt(PI_M);

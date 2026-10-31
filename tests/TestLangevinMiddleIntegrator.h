@@ -29,7 +29,9 @@
 
 #include "openmm/internal/AssertionUtilities.h"
 #include "openmm/Context.h"
+#include "openmm/CustomBondForce.h"
 #include "openmm/CustomExternalForce.h"
+#include "openmm/CustomIntegrator.h"
 #include "openmm/HarmonicBondForce.h"
 #include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
@@ -313,6 +315,158 @@ void testForceGroups() {
     ASSERT(pos[2] == 0);
 }
 
+
+/**
+ * Build a periodic box of charged dimers (with the two atoms of each dimer excluded from each other) and ions.
+ */
+System* createDimerBox(vector<Vec3>& positions, vector<Vec3>& velocities, double alpha) {
+    const int gridSize = 4;
+    const double boxSize = 2.4;
+    System* system = new System();
+    system->setDefaultPeriodicBoxVectors(Vec3(boxSize, 0, 0), Vec3(0, boxSize, 0), Vec3(0, 0, boxSize));
+    NonbondedForce* nonbonded = new NonbondedForce();
+    nonbonded->setNonbondedMethod(NonbondedForce::PME);
+    nonbonded->setCutoffDistance(0.9);
+    nonbonded->setPMEParameters(alpha, 24, 24, 24);
+    HarmonicBondForce* bonds = new HarmonicBondForce();
+    OpenMM_SFMT::SFMT sfmt;
+    init_gen_rand(0, sfmt);
+    for (int i = 0; i < gridSize; i++)
+        for (int j = 0; j < gridSize; j++)
+            for (int k = 0; k < gridSize; k++) {
+                Vec3 pos = Vec3(i, j, k)*(boxSize/gridSize);
+                double sign = ((i+j+k)%2 == 0 ? 1.0 : -1.0);
+                if ((i+j+k)%3 == 0) {
+                    // An ion.
+
+                    system->addParticle(20.0);
+                    nonbonded->addParticle(sign, 0.3, 0.5);
+                    positions.push_back(pos);
+                }
+                else {
+                    // A dimer with partial charges.
+
+                    int first = system->getNumParticles();
+                    system->addParticle(12.0);
+                    system->addParticle(4.0);
+                    nonbonded->addParticle(0.6*sign, 0.3, 0.5);
+                    nonbonded->addParticle(-0.3*sign, 0.2, 0.1);
+                    nonbonded->addException(first, first+1, 0.0, 1.0, 0.0);
+                    bonds->addBond(first, first+1, 0.12, 50000.0);
+                    positions.push_back(pos);
+                    positions.push_back(pos+Vec3(0.12, 0, 0));
+                }
+            }
+    for (int i = 0; i < system->getNumParticles(); i++)
+        velocities.push_back(Vec3(genrand_real2(sfmt)-0.5, genrand_real2(sfmt)-0.5, genrand_real2(sfmt)-0.5)*2.0);
+    system->addForce(nonbonded);
+    system->addForce(bonds);
+    return system;
+}
+
+void testReciprocalSpaceInterval() {
+    // Run with reciprocal space every 3 steps, and compare to a CustomIntegrator doing the same thing explicitly:
+    // reciprocal space plus the correction for excluded pairs (moved to group 1 by two CustomBondForces) is applied
+    // with 3 times its magnitude on every 3rd step.  With no friction the trajectories are deterministic.
+
+    const int interval = 3, numSteps = 30;
+    const double dt = 0.002, alpha = 3.0;
+    vector<Vec3> positions, velocities;
+    System* system = createDimerBox(positions, velocities, alpha);
+    if (platform.getName() == "CPU") {
+        // This platform doesn't support it, so stepping should fail.
+
+        LangevinMiddleIntegrator integrator(300.0, 0.0, dt);
+        integrator.setReciprocalSpaceInterval(interval);
+        Context context(*system, integrator, platform);
+        context.setPositions(positions);
+        bool threw = false;
+        try {
+            integrator.step(1);
+        }
+        catch (const OpenMMException& ex) {
+            threw = true;
+        }
+        ASSERT(threw);
+        delete system;
+        return;
+    }
+    LangevinMiddleIntegrator integrator(300.0, 0.0, dt);
+    integrator.setReciprocalSpaceInterval(interval);
+    ASSERT_EQUAL(interval, integrator.getReciprocalSpaceInterval());
+    Context context(*system, integrator, platform);
+    context.setPositions(positions);
+    context.setVelocities(velocities);
+    integrator.step(numSteps/2);
+    integrator.step(numSteps-numSteps/2);
+    vector<Vec3> mtsPositions = context.getState(State::Positions).getPositions();
+
+    // The same system, with the slow forces in group 1.
+
+    vector<Vec3> positions2, velocities2;
+    System* system2 = createDimerBox(positions2, velocities2, alpha);
+    NonbondedForce& nonbonded = dynamic_cast<NonbondedForce&>(system2->getForce(0));
+    nonbonded.setReciprocalSpaceForceGroup(1);
+    string erfTerm = "q*erf("+to_string(alpha)+"*r)/r";
+    CustomBondForce* cancel = new CustomBondForce(to_string(ONE_4PI_EPS0)+"*"+erfTerm);
+    CustomBondForce* move = new CustomBondForce("-"+to_string(ONE_4PI_EPS0)+"*"+erfTerm);
+    cancel->addPerBondParameter("q");
+    move->addPerBondParameter("q");
+    cancel->setUsesPeriodicBoundaryConditions(true);
+    move->setUsesPeriodicBoundaryConditions(true);
+    for (int i = 0; i < nonbonded.getNumExceptions(); i++) {
+        int p1, p2;
+        double chargeProd, sigma, epsilon, q1, q2;
+        nonbonded.getExceptionParameters(i, p1, p2, chargeProd, sigma, epsilon);
+        nonbonded.getParticleParameters(p1, q1, sigma, epsilon);
+        nonbonded.getParticleParameters(p2, q2, sigma, epsilon);
+        cancel->addBond(p1, p2, {q1*q2});
+        move->addBond(p1, p2, {q1*q2});
+    }
+    move->setForceGroup(1);
+    system2->addForce(cancel);
+    system2->addForce(move);
+    CustomIntegrator custom(dt);
+    custom.addGlobalVariable("phase", 0);
+    custom.addGlobalVariable("scale", 0);
+    custom.addComputeGlobal("scale", to_string(interval)+"*delta(phase)");
+    custom.addComputePerDof("v", "v+dt*f0/m");
+    custom.addComputePerDof("v", "v+dt*scale*f1/m");
+    custom.addComputePerDof("x", "x+dt*v");
+    custom.addComputeGlobal("phase", "select(step(phase+1-"+to_string(interval)+"), 0, phase+1)");
+    Context context2(*system2, custom, platform);
+    context2.setPositions(positions2);
+    context2.setVelocities(velocities2);
+    custom.step(numSteps);
+    vector<Vec3> customPositions = context2.getState(State::Positions).getPositions();
+
+    // A normal integrator, to confirm the test can tell the difference.
+
+    LangevinMiddleIntegrator plain(300.0, 0.0, dt);
+    Context context3(*system, plain, platform);
+    context3.setPositions(positions);
+    context3.setVelocities(velocities);
+    plain.step(numSteps);
+    vector<Vec3> plainPositions = context3.getState(State::Positions).getPositions();
+    double maxCustomDiff = 0, maxPlainDiff = 0;
+    for (int i = 0; i < system->getNumParticles(); i++) {
+        maxCustomDiff = max(maxCustomDiff, sqrt((mtsPositions[i]-customPositions[i]).dot(mtsPositions[i]-customPositions[i])));
+        maxPlainDiff = max(maxPlainDiff, sqrt((mtsPositions[i]-plainPositions[i]).dot(mtsPositions[i]-plainPositions[i])));
+    }
+    ASSERT(maxCustomDiff < 1e-4);
+    ASSERT(maxPlainDiff > 1e-3);
+
+    // Forces requested outside of a step are unaffected.
+
+    State s1 = context.getState(State::Forces | State::Positions);
+    context3.setPositions(s1.getPositions());
+    State s3 = context3.getState(State::Forces);
+    for (int i = 0; i < system->getNumParticles(); i++)
+        ASSERT_EQUAL_VEC(s3.getForces()[i], s1.getForces()[i], 1e-4);
+    delete system;
+    delete system2;
+}
+
 void runPlatformTests();
 
 int main(int argc, char* argv[]) {
@@ -325,6 +479,7 @@ int main(int argc, char* argv[]) {
         testRandomSeed();
         testInitialTemperature();
         testForceGroups();
+        testReciprocalSpaceInterval();
         runPlatformTests();
     }
     catch(const exception& e) {

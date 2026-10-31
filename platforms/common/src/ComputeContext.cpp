@@ -30,6 +30,7 @@
 #include "openmm/internal/ThreadPool.h"
 #include "CommonKernelSources.h"
 #include "hilbert.h"
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -43,8 +44,14 @@ using namespace std;
 const int ComputeContext::ThreadBlockSize = 64;
 const int ComputeContext::TileSize = 32;
 
-ComputeContext::ComputeContext(const System& system) : system(system), time(0.0), stepCount(0), computeForceCount(0), stepsSinceReorder(99999),
+ComputeContext::ComputeContext(const System& system) : system(system), time(0.0), stepCount(0), computeForceCount(0), stepsSinceReorder(99999), reorderInterval(250), pmeSortInterval(0),
         forceNextReorder(false), atomsWereReordered(false), forcesValid(false), hasInitializedGlobals(false), hasAssignedPosqCharges(false) {
+    // Reordering stalls the GPU while the CPU sorts the molecules.  OPENMM_REORDER_INTERVAL sets how often it is done
+    // periodically (by default every 250 steps; CudaContext uses 1000).  The neighbor list still forces a reorder
+    // when its size grows by more than 10%.
+    const char* interval = getenv("OPENMM_REORDER_INTERVAL");
+    if (interval != NULL && atoi(interval) > 0)
+        reorderInterval = atoi(interval);
     workThread = new WorkThread();
 }
 
@@ -665,7 +672,7 @@ void ComputeContext::forceReorder() {
 
 void ComputeContext::reorderAtoms() {
     atomsWereReordered = false;
-    if (numAtoms == 0 || !getNonbondedUtilities().getUseCutoff() || (stepsSinceReorder < 250 && !forceNextReorder)) {
+    if (numAtoms == 0 || !getNonbondedUtilities().getUseCutoff() || (stepsSinceReorder < reorderInterval && !forceNextReorder)) {
         stepsSinceReorder++;
         return;
     }

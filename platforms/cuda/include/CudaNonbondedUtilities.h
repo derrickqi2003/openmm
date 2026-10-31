@@ -287,6 +287,8 @@ public:
      * @param groups    the set of force groups
      */
     void createKernelsForGroups(int groups);
+    void reportBuildTiming();
+    void enlargeNeighborList(unsigned int tiles, unsigned int pairs);
     /**
      * Set the source code for the main kernel.  This defaults to the content of nonbonded.cu.  It only needs to be
      * changed in very unusual circumstances.
@@ -318,10 +320,38 @@ private:
     CudaArray largeBlockBoundingBox;
     CudaArray oldPositions;
     CudaArray rebuildNeighborList;
+    // Used only with a pruned neighbor list: the outer list (each block's neighbors within the cutoff plus the outer
+    // padding, stored in its own part of outerAtoms), the largest count for any block, and the positions the
+    // pruned list was built from.
+    CudaArray outerAtoms;
+    CudaArray outerBlockCounts;
+    CudaArray outerCount;
+    CudaArray prunePositions;
+    // The atoms kept by pruneFilter for each block (in the same layout as outerAtoms), their flags, and how many.
+    CudaArray survivorAtoms;
+    CudaArray survivorFlags;
+    CudaArray survivorCounts;
+    // Diagnostic timing of findBlocksWithInteractions (OPENMM_CUDA_BUILD_TIMING=1).
+    CudaArray buildTiming;
+    // Used only with a split build of the ordinary list: atoms left over by each segment, how many per block, and how
+    // many of the block's segments have finished.
+    CudaArray leftoverAtoms;
+    CudaArray leftoverCount;
+    CudaArray segmentsDone;
+    // Used only when findBlockBoundsByWarp checks whether to rebuild the list: whether each of its work groups found
+    // an atom that has moved too far.
+    CudaArray rebuildFlags;
+    // Used only with an anchored outer list: for each atom, the offset to the index of the atom it follows and the
+    // largest distance between them, the anchored positions the outer list is built from, and their bounding boxes.
+    CudaArray anchorOffsets;
+    CudaArray anchorMargins;
+    CudaArray outerPositions;
+    CudaArray outerBlockCenter;
+    CudaArray outerBlockBoundingBox;
     ComputeSort blockSorter;
     CUevent downloadCountEvent;
     unsigned int* pinnedCountBuffer;
-    std::vector<void*> forceArgs, findBlockBoundsArgs, checkRebuildArgs, computeSortKeysArgs, sortBlockKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs;
+    std::vector<void*> forceArgs, findBlockBoundsArgs, checkRebuildArgs, computeSortKeysArgs, sortBlockKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs, pruneFilterArgs, prunePackArgs, outerBoundsArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;
     std::vector<ComputeParameterInfo> arguments;
@@ -330,9 +360,13 @@ private:
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
     bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams;
-    bool useLazyOverflowCheck, lazyCheckActive, countDownloadPending, useGatedBlockSort;
+    bool useLazyOverflowCheck, lazyCheckActive, countDownloadPending, useGatedBlockSort, useWarpBlockBounds, checkRebuildInBounds, useBuildPrefilter, pruningRequested, usePruning;
+    bool anchoringRequested, useAnchors, buildTimingRequested, growNeighborListDisabled, twoAtomsPerLane;
+    int splitSegment, buildTimingCalls, buildTimingReports;
+    double ordinaryPadding;
+    double outerPadding, innerPadding, maxAnchorMargin;
     int startTileIndex, startBlockIndex, numBlocks, maxExclusions, numForceThreadBlocks, forceThreadBlockSize, numAtoms, groupFlags, numBlockSizes, paramStartIndex;
-    unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
+    unsigned int maxTiles, maxSinglePairs, tilesAfterReorder, outerCapacity;
     long long numTiles;
     std::string kernelSource;
 };
@@ -354,6 +388,9 @@ public:
     CUfunction sortBoxDataKernel;
     CUfunction findInteractingBlocksKernel;
     CUfunction findInteractionsWithinBlocksKernel;
+    CUfunction pruneFilterKernel;
+    CUfunction prunePackKernel;
+    CUfunction outerBoundsKernel;
 };
 
 } // namespace OpenMM

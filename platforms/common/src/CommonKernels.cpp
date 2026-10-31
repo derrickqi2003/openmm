@@ -3151,10 +3151,11 @@ void CommonIntegrateLangevinMiddleStepKernel::initialize(const System& system, c
     cc.initializeContexts();
     ContextSelector selector(cc);
     cc.getIntegrationUtilities().initRandomNumberGenerator(integrator.getRandomNumberSeed());
-    ComputeProgram program = cc.compileProgram(CommonKernelSources::langevinMiddle);
+    ComputeProgram program = cc.compileProgram(CommonKernelSources::constraintClusters+CommonKernelSources::langevinMiddle);
     kernel1 = program->createKernel("integrateLangevinMiddlePart1");
     kernel2 = program->createKernel("integrateLangevinMiddlePart2");
     kernel3 = program->createKernel("integrateLangevinMiddlePart3");
+    clusterKernel = program->createKernel("integrateLangevinMiddleClusters");
     if (cc.getUseDoublePrecision() || cc.getUseMixedPrecision()) {
         params.initialize<double>(cc, 2, "langevinMiddleParams");
         oldDelta.initialize<mm_double4>(cc, cc.getPaddedNumAtoms(), "oldDelta");
@@ -3173,6 +3174,82 @@ void CommonIntegrateLangevinMiddleStepKernel::execute(ContextImpl& context, cons
     int paddedNumAtoms = cc.getPaddedNumAtoms();
     if (!hasInitializedKernels) {
         hasInitializedKernels = true;
+
+        // When every constraint is in a SETTLE or SHAKE cluster, one kernel takes each cluster or unconstrained atom
+        // through the whole step.  Every atom must belong to exactly one of them, and clusters must not contain
+        // massless particles, which the separate kernels skip.
+
+        const System& system = context.getSystem();
+        const char* fusedSetting = getenv("OPENMM_FUSED_INTEGRATION");
+        useClusterKernel = (integration.getConstraintsAreClusters() && (fusedSetting == NULL || string(fusedSetting) != "0"));
+        int numSettle = (integration.getSettleAtoms().isInitialized() ? integration.getSettleAtoms().getSize() : 0);
+        int numShake = (integration.getShakeAtoms().isInitialized() ? integration.getShakeAtoms().getSize() : 0);
+        vector<mm_int4> settleAtoms, shakeAtoms;
+        if (useClusterKernel && numSettle > 0) {
+            settleAtoms.resize(numSettle);
+            integration.getSettleAtoms().download(settleAtoms.data());
+        }
+        if (useClusterKernel && numShake > 0) {
+            shakeAtoms.resize(numShake);
+            integration.getShakeAtoms().download(shakeAtoms.data());
+        }
+        vector<int> clusterCount(numAtoms, 0);
+        for (mm_int4 atoms : settleAtoms)
+            for (int atom : {atoms.x, atoms.y, atoms.z})
+                clusterCount[atom]++;
+        for (mm_int4 atoms : shakeAtoms)
+            for (int atom : {atoms.x, atoms.y, atoms.z, atoms.w})
+                if (atom != -1)
+                    clusterCount[atom]++;
+        vector<int> freeAtomsVec;
+        for (int i = 0; i < numAtoms && useClusterKernel; i++) {
+            if (clusterCount[i] == 0)
+                freeAtomsVec.push_back(i);
+            else if (clusterCount[i] > 1 || system.getParticleMass(i) == 0.0)
+                useClusterKernel = false;
+        }
+        if (useClusterKernel) {
+            numClusterItems = numSettle+numShake+(int) freeAtomsVec.size();
+            unusedClusterArray.initialize<mm_int4>(cc, 1, "unusedClusterArray");
+            if (freeAtomsVec.size() > 0) {
+                freeAtoms.initialize<int>(cc, freeAtomsVec.size(), "freeAtoms");
+                freeAtoms.upload(freeAtomsVec);
+            }
+            clusterKernel->addArg(numSettle);
+            clusterKernel->addArg(numShake);
+            clusterKernel->addArg((int) freeAtomsVec.size());
+            clusterKernel->addArg(paddedNumAtoms);
+            clusterKernel->addArg(); // The constraint tolerance will be set just before it is executed.
+            clusterKernel->addArg(cc.getPosq());
+            clusterKernel->addArg(cc.getVelm());
+            clusterKernel->addArg(cc.getLongForceBuffer());
+            clusterKernel->addArg(integration.getStepSize());
+            clusterKernel->addArg(params);
+            clusterKernel->addArg(integration.getRandom());
+            clusterKernel->addArg(); // Random index will be set just before it is executed.
+            if (numSettle > 0) {
+                clusterKernel->addArg(integration.getSettleAtoms());
+                clusterKernel->addArg(integration.getSettleParams());
+            }
+            else {
+                clusterKernel->addArg(unusedClusterArray);
+                clusterKernel->addArg(unusedClusterArray);
+            }
+            if (numShake > 0) {
+                clusterKernel->addArg(integration.getShakeAtoms());
+                clusterKernel->addArg(integration.getShakeParams());
+            }
+            else {
+                clusterKernel->addArg(unusedClusterArray);
+                clusterKernel->addArg(unusedClusterArray);
+            }
+            if (freeAtomsVec.size() > 0)
+                clusterKernel->addArg(freeAtoms);
+            else
+                clusterKernel->addArg(unusedClusterArray);
+            if (cc.getUseMixedPrecision())
+                clusterKernel->addArg(cc.getPosqCorrection());
+        }
         kernel1->addArg(numAtoms);
         kernel1->addArg(paddedNumAtoms);
         kernel1->addArg(cc.getVelm());
@@ -3216,12 +3293,23 @@ void CommonIntegrateLangevinMiddleStepKernel::execute(ContextImpl& context, cons
 
     // Perform the integration.
 
-    kernel2->setArg(7, integration.prepareRandomNumbers(cc.getPaddedNumAtoms()));
-    kernel1->execute(numAtoms);
-    integration.applyVelocityConstraints(integrator.getConstraintTolerance());
-    kernel2->execute(numAtoms);
-    integration.applyConstraints(integrator.getConstraintTolerance());
-    kernel3->execute(numAtoms);
+    int randomIndex = integration.prepareRandomNumbers(cc.getPaddedNumAtoms());
+    if (useClusterKernel) {
+        if (cc.getUseDoublePrecision() || cc.getUseMixedPrecision())
+            clusterKernel->setArg(4, integrator.getConstraintTolerance());
+        else
+            clusterKernel->setArg(4, (float) integrator.getConstraintTolerance());
+        clusterKernel->setArg(11, randomIndex);
+        clusterKernel->execute(numClusterItems);
+    }
+    else {
+        kernel2->setArg(7, randomIndex);
+        kernel1->execute(numAtoms);
+        integration.applyVelocityConstraints(integrator.getConstraintTolerance());
+        kernel2->execute(numAtoms);
+        integration.applyConstraints(integrator.getConstraintTolerance());
+        kernel3->execute(numAtoms);
+    }
     integration.computeVirtualSites();
 
     // Update the time and step count.
@@ -3424,7 +3512,7 @@ void CommonIntegrateVariableLangevinStepKernel::initialize(const System& system,
     cc.initializeContexts();
     ContextSelector selector(cc);
     cc.getIntegrationUtilities().initRandomNumberGenerator(integrator.getRandomNumberSeed());
-    ComputeProgram program = cc.compileProgram(CommonKernelSources::langevinMiddle);
+    ComputeProgram program = cc.compileProgram(CommonKernelSources::constraintClusters+CommonKernelSources::langevinMiddle);
     kernel1 = program->createKernel("integrateLangevinMiddlePart1");
     kernel2 = program->createKernel("integrateLangevinMiddlePart2");
     kernel3 = program->createKernel("integrateLangevinMiddlePart3");
@@ -3725,8 +3813,13 @@ void CommonRemoveCMMotionKernel::initialize(const System& system, const CMMotion
 
 void CommonRemoveCMMotionKernel::execute(ContextImpl& context) {
     ContextSelector selector(cc);
-    kernel1->execute(cc.getNumAtoms(), 64);
-    kernel2->execute(cc.getNumAtoms(), 64);
+
+    // Every work group of the second kernel adds up the momenta of all work groups of the first, so both use one
+    // work group for every 256 atoms instead of the most the device allows.  They must use the same number.
+
+    int threads = 64*max(1, min(cc.getNumThreadBlocks(), cc.getNumAtoms()/256));
+    kernel1->execute(threads, 64);
+    kernel2->execute(threads, 64);
 }
 
 class CommonCalcRMSDForceKernel::ForceInfo : public ComputeForceInfo {

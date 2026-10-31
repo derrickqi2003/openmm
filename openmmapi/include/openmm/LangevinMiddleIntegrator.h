@@ -111,6 +111,28 @@ public:
         randomNumberSeed = seed;
     }
     /**
+     * Get the number of steps between evaluations of the reciprocal space part of Ewald and PME.  See
+     * setReciprocalSpaceInterval() for details.
+     */
+    int getReciprocalSpaceInterval() const {
+        return reciprocalSpaceInterval;
+    }
+    /**
+     * Set the number of steps between evaluations of the reciprocal space part of Ewald and PME.  The default
+     * value of 1 evaluates it every step.  A larger value n uses multiple time stepping (impulse r-RESPA):
+     * reciprocal space forces, together with the reciprocal space correction for excluded pairs, are computed
+     * only on every n'th step and applied with n times their magnitude, while all other forces are computed
+     * every step.  This makes the slowly varying long range electrostatics cheaper, at the cost of a small
+     * change in the dynamics.
+     *
+     * Values greater than 1 are supported for NonbondedForce on the Reference, CUDA, OpenCL, HIP, and Metal
+     * platforms.  An exception is thrown when stepping a Context whose System contains other forces with a
+     * reciprocal space part, or that uses another platform.
+     *
+     * @param interval    the number of steps between reciprocal space evaluations
+     */
+    void setReciprocalSpaceInterval(int interval);
+    /**
      * Advance a simulation through time by taking a series of time steps.
      * 
      * @param steps   the number of time steps to take
@@ -148,8 +170,10 @@ protected:
         return getStepSize()/2;
     }
 private:
+    void checkReciprocalSpaceIntervalSupported();
     double temperature, friction;
-    int randomNumberSeed;
+    int randomNumberSeed, reciprocalSpaceInterval;
+    bool reciprocalSpaceIntervalChecked;
     Kernel kernel;
 };
 

@@ -46,6 +46,8 @@ void LangevinMiddleIntegratorProxy::serialize(const void* object, SerializationN
     node.setDoubleProperty("friction", integrator.getFriction());
     node.setIntProperty("randomSeed", integrator.getRandomNumberSeed());
     node.setIntProperty("integrationForceGroups", integrator.getIntegrationForceGroups());
+    if (integrator.getReciprocalSpaceInterval() != 1)
+        node.setIntProperty("reciprocalSpaceInterval", integrator.getReciprocalSpaceInterval());
 }
 
 void* LangevinMiddleIntegratorProxy::deserialize(const SerializationNode& node) const {
@@ -56,5 +58,6 @@ void* LangevinMiddleIntegratorProxy::deserialize(const SerializationNode& node) 
     integrator->setConstraintTolerance(node.getDoubleProperty("constraintTolerance"));
     integrator->setRandomNumberSeed(node.getIntProperty("randomSeed"));
     integrator->setIntegrationForceGroups(node.getIntProperty("integrationForceGroups", 0xFFFFFFFF));
+    integrator->setReciprocalSpaceInterval(node.getIntProperty("reciprocalSpaceInterval", 1));
     return integrator;
 }

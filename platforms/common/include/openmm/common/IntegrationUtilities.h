@@ -141,6 +141,40 @@ public:
      * @param velocities  the shifted velocities are returned in this
      */
     void computeShiftedVelocities(double timeShift, std::vector<Vec3>& velocities);
+    /**
+     * Get whether every constraint is enforced by SETTLE or SHAKE, which treat each cluster of at most four atoms on
+     * its own.  An integrator can then apply the constraints within its own kernels, using the functions in
+     * CommonKernelSources::constraintClusters with the arrays returned by getSettleAtoms(), getSettleParams(),
+     * getShakeAtoms() and getShakeParams().
+     */
+    bool getConstraintsAreClusters() const {
+        return !ccmaConstraintAtoms.isInitialized();
+    }
+    /**
+     * Get the atoms of each SETTLE cluster, with the central atom first.  The array is uninitialized if there are none.
+     */
+    ArrayInterface& getSettleAtoms() {
+        return settleAtoms;
+    }
+    /**
+     * Get the parameters of each SETTLE cluster.
+     */
+    ArrayInterface& getSettleParams() {
+        return settleParams;
+    }
+    /**
+     * Get the atoms of each SHAKE cluster, with the central atom first and -1 for unused elements.  The array is
+     * uninitialized if there are none.
+     */
+    ArrayInterface& getShakeAtoms() {
+        return shakeAtoms;
+    }
+    /**
+     * Get the parameters of each SHAKE cluster.
+     */
+    ArrayInterface& getShakeParams() {
+        return shakeParams;
+    }
 protected:
     virtual void applyConstraintsImpl(bool constrainVelocities, double tol) = 0;
     ComputeContext& context;
