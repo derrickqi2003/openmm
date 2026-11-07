@@ -212,7 +212,7 @@ Measured on the RTX 3090 with `settings_bench.py` (each in its own process) and 
 | 5 or 6 fs with H 4 amu | NaN within 1000 steps | a CH₃ carbon is left with ~3 amu |
 | 6 fs, H 3 amu (with or without water H 3 amu) | NaN within 7000 steps | |
 
-"Water H 3 amu" moves mass from each SPC/E oxygen to its hydrogens (O 10.0 amu). Water is rigid, so this changes only
+"Water H 3 amu" moves mass from each SPC/E oxygen to its hydrogens (O 12.0 amu). Water is rigid, so this changes only
 how fast it rotates, not its equilibrium, and it slows the fastest atoms, so the neighbor list is rebuilt less often.
 Three replicates each:
 
