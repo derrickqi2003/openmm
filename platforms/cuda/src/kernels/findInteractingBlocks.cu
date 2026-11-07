@@ -902,6 +902,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
             int block2 = block2Base+indexInWarp;
             bool includeBlock2 = (block2 < segmentEnd);
             bool forceInclude = false;
+            int blockY = 0;
             if (includeBlock2) {
                 real4 blockCenterY = sortedBlockCenter[block2];
                 real3 blockSizeY = sortedBlockBoundingBox[block2].toReal3();
@@ -922,14 +923,17 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
                     includeBlock2 = forceInclude = true;
 #endif
                 if (includeBlock2) {
-                    int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
+                    blockY = sortedBlocks[block2] & BLOCK_INDEX_MASK;
                     #pragma unroll 4 // (MAX_EXCLUSIONS)
                     for (int k = 0; k < numExclusions; k++)
-                        includeBlock2 &= (exclusionsForX[k] != y);
+                        includeBlock2 &= (exclusionsForX[k] != blockY);
                 }
             }
             
-            // Loop over any blocks we identified as potentially containing neighbors.
+            // Loop over any blocks we identified as potentially containing neighbors.  This loop waits on memory more
+            // than it computes, so each candidate's block index comes from the lane that tested it rather than from
+            // memory, which takes a load out of the chain that leads to loading its atoms.  (Also loading the next
+            // candidate's atoms ahead made the build 18% slower.)
             
             int includeBlockFlags = BALLOT(includeBlock2);
             int forceIncludeFlags = BALLOT(forceInclude);
@@ -937,7 +941,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
                 int i = __ffs(includeBlockFlags)-1;
                 includeBlockFlags &= includeBlockFlags-1;
                 forceInclude = (forceIncludeFlags>>i) & 1;
-                int y = sortedBlocks[block2Base+i] & BLOCK_INDEX_MASK;
+                int y = __shfl_sync(0xffffffff, blockY, i);
 #ifdef BUILD_TIMING
                 numCandidates++;
 #endif

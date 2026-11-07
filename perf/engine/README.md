@@ -151,9 +151,78 @@ These are implemented, correct (tested), and off by default.
   including the few very large blocks that need the slow per-pair periodic path, so one warp did most of the work and
   the build took 2.4× longer. The split build keeps OpenMM's ownership and splits only the work.
 - **Prefetching** the next candidate block's atoms in the build: the kernel is limited to 80 registers by its launch
-  bounds, and the prefetch made it spill (16 bytes per thread), so it was slower; the loads it removed hit in L1.
+  bounds, and the prefetch made it spill (16 bytes per thread), so it was slower; the loads it removed hit in L1. Tried
+  again on an RTX 3090 without spilling (80 registers): rebuilds took 150 µs instead of 128. What is kept is taking each
+  candidate's block index by a warp shuffle from the lane that tested it, instead of reloading it, which takes one load
+  out of the chain that leads to loading its atoms: rebuilds 128 → 124 µs (−3%), about +0.5% overall.
+- **Testing a per-tile bit mask instead of each atom's index** for padding atoms in the force loop: the loop went from 116
+  to 114 instructions per two pairs and the kernel time did not change.
+- **Launching PME charge spreading with 4× the threads** (it runs at 23% occupancy): the kernel only went from 46 to
+  42 µs, since it is limited by atomic additions in L2 (1.18M per evaluation), and the step got 2–3.5% slower because
+  it then competes harder with the force kernel. Even with no atomics at all (timing only) the step would gain 8 µs.
+- **The single-pair threshold** (`MAX_BITS_FOR_PAIRS`, upstream's 3 on this GPU): 0 → −8%, 1 → −5%, 2 → −2%, 4 and 5
+  → within ±0.5%, 6 → −1%, 8 → −6%.
 - **One kernel for the block sort** (one work group): the sort ran on a single SM and took longer than the three
   kernels it replaced.
+
+## Hardware counters, and how far engine work can go
+
+Nsight Compute's counters are blocked in containers (`ERR_NVGPUCTRPERM`), so these were measured on an RTX 3090 rented
+as a VM (KVM, where root can read them), with perf/engine at 1,619 ns/day (1,222 before it) on that GPU.
+
+- **Force kernel:** 75% of issue slots busy, 62% of instructions are FP32 multiply/add, 3 special-function
+  instructions per pair; ~58 instructions per pair in the loop including shuffles. Of its warp samples, 59% are in the
+  pair loop, 14% in the single-pair loop (5 loads and 6 atomics per pair), 13% in tiles with exclusions.
+- **PME spreading, interpolation, bonded forces, fused integration:** 55–61% of stalls wait on memory, at 8–23%
+  occupancy (every CUDA kernel's grid is capped at 6 blocks of 64 threads per SM, and the integration has one thread per
+  constraint cluster).
+- **What each part is worth in the concurrent step** (Verlet steps of 1e-9 ps, so the list is never rebuilt; force
+  groups left out of the integration):
+
+  | computed | µs per step |
+  |---|---|
+  | everything | 176 |
+  | without PME reciprocal space | 149 |
+  | without bonded forces | 173 |
+  | without centre-of-mass motion removal | 169 |
+  | direct space only | 137.5 |
+
+  Kernel times measured one at a time overstate what speeding up PME and the small kernels would gain: most of their
+  time is hidden behind the force kernel. Direct space plus the list build is ~80% of a production step.
+- **GROMACS 2025.4 on the same system and GPU** (same topology and coordinates, hydrogen mass 3 amu, 4 fs, PME on
+  OpenMM's 60³ grid but order 4, the only order its GPU PME supports, and its `md` integrator, which GPU update needs):
+  1,198 ns/day with its default list interval, 1,307 at its best (`-nstlist 100`), against 1,619 for perf/engine. Its
+  cluster-pair design is the one an OpenMM rewrite would copy, so a same-settings 2× is not available from engine work.
+
+## Larger time steps (settings for the run scripts, not the engine)
+
+Measured on the RTX 3090 with `settings_bench.py` (each in its own process) and checked with `validate_settings.py`
+(5 ns NPT from the same equilibrated state, sampled every ps after 0.5 ns, three seeds each, compared with
+`compare_reps.py`):
+
+| settings | ns/day | |
+|---|---|---|
+| `npt/run_4fs.py` (4 fs, H 3 amu) | 1,609–1,628 | |
+| centre-of-mass removal every 100 steps | 1,609 | no gain |
+| reciprocal space every 2nd step | 1,697–1,711 | shifts the potential energy (see above) |
+| 5 fs | 1,909 | stable |
+| 5.5 fs | 2,074 | stable |
+| **5.5 fs, water H 3 amu** | **2,260** | **1.40×; matches 4 fs in density, energy and chain Rg** |
+| 5.5 fs, water H 3 amu, reciprocal every 2nd step | 2,371 | potential energy +110 to +195 kJ/mol (3–5σ) |
+| 5 or 6 fs with H 4 amu | NaN within 1000 steps | a CH₃ carbon is left with ~3 amu |
+| 6 fs, H 3 amu (with or without water H 3 amu) | NaN within 7000 steps | |
+
+"Water H 3 amu" moves mass from each SPC/E oxygen to its hydrogens (O 10.0 amu). Water is rigid, so this changes only
+how fast it rotates, not its equilibrium, and it slows the fastest atoms, so the neighbor list is rebuilt less often.
+Three replicates each:
+
+| | 4 fs (now) | 5.5 fs, water H 3 amu | difference |
+|---|---|---|---|
+| density (kg/m³) | 1041.16 ± 0.12 | 1041.11 ± 0.04 | −0.4 × its error |
+| potential energy (kJ/mol) | −546,775 ± 15 | −546,765 ± 3 | +0.7 × |
+| mean chain Rg (nm) | 0.9220 ± 0.0026 | 0.9221 ± 0.0014 | 0.0 × |
+| inter-chain heavy-atom contacts < 0.5 nm | 205 ± 33 (runs: 177, 168, 270) | 148 ± 19 | −1.5 × (not converged in 5 ns) |
+| kinetic temperature (K) | 300.95 | 301.12 | +0.17 (how kinetic T reads at a larger step) |
 
 ## Settings (environment variables, read when a Context is created)
 
@@ -183,3 +252,6 @@ It builds with CUDA, runs 14 CUDA test programs with the ordinary and the pruned
 separate kernels) and `engine_bench.py` (ns/day for each variant in its own process, at production settings). For the
 benchmark, start from an equilibrated state (`npt/state_post_npt_equil.xml`), and use single precision, which
 `npt/run_4fs.py` uses; mixed precision is 20% slower and spends its time differently.
+
+It builds with a CUDA 12 or 13 toolkit (upstream now uses CUDA 13's names for 16-byte aligned 64-bit vectors in the
+kernels it compiles at run time; `common.cu` falls back to the CUDA 12 names).

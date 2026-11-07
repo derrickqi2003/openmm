@@ -21,14 +21,23 @@
 #define ATOMIC_ADD(dest, value) atomicAdd(dest, value)
 #define FLT_MAX 3.40282347e+38f
 
+// CUDA 13 renamed the 16 byte aligned 4-vectors of 64 bit integers; before it they have no suffix.
 typedef long long mm_long;
 typedef longlong2 mm_long2;
 typedef longlong3 mm_long3;
+#if __CUDACC_VER_MAJOR__ < 13
+typedef longlong4 mm_long4;
+#else
 typedef longlong4_16a mm_long4;
+#endif
 typedef unsigned long long mm_ulong;
 typedef ulonglong2 mm_ulong2;
 typedef ulonglong3 mm_ulong3;
+#if __CUDACC_VER_MAJOR__ < 13
+typedef ulonglong4 mm_ulong4;
+#else
 typedef ulonglong4_16a mm_ulong4;
+#endif
 
 #define SUPPORTS_64_BIT_ATOMICS 1
 #define SUPPORTS_DOUBLE_PRECISION 1
